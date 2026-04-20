@@ -60,26 +60,26 @@ run_dedupe_step() {
   local force_dedupe="${OJS_FORCE_DEDUPE:-0}"
   local dedupe_args="${OJS_DEDUPE_ARGS:---overwrite}"
 
-  if [[ "${force_dedupe}" == "1" || ! -f "clean/deduplicated.parquet" ]]; then
+  if [[ "${force_dedupe}" == "1" || ! -f "data/clean/deduplicated.parquet" ]]; then
     log "Running src/2_deduplicate.py"
     # shellcheck disable=SC2086
     python src/2_deduplicate.py ${dedupe_args}
   else
-    log "Skipping src/2_deduplicate.py (clean/deduplicated.parquet already exists)"
+    log "Skipping src/2_deduplicate.py (data/clean/deduplicated.parquet already exists)"
   fi
 }
 
 run_api_step() {
   local api_args="${OJS_API_ARGS:-}"
   if [[ -z "${api_args}" ]]; then
-    api_args="--input ${APP_ROOT}/clean/deduplicated.parquet --host 0.0.0.0 --port 8000"
+    api_args="--input ${APP_ROOT}/data/clean/deduplicated.parquet --host 0.0.0.0 --port 8000"
   fi
   log "Starting src/3_build_api.py"
   # shellcheck disable=SC2086
   exec python src/3_build_api.py ${api_args}
 }
 
-mkdir -p "${APP_ROOT}/data/raw_sql" "${APP_ROOT}/data/raw_parquet" "${APP_ROOT}/data/raw" "${APP_ROOT}/clean"
+mkdir -p "${APP_ROOT}/data/raw_sql" "${APP_ROOT}/data/raw_parquet" "${APP_ROOT}/data/raw" "${APP_ROOT}/data/clean"
 
 run_convert_step
 run_join_step

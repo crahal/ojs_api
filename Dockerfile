@@ -15,7 +15,7 @@ COPY README.md /app/README.md
 COPY LICENSE /app/LICENSE
 
 RUN chmod +x /app/scripts/compose_start.sh \
-    && mkdir -p /app/clean /app/data/raw_sql /app/data/raw_parquet /app/data/raw /tmp/ojs_api_api_duckdb_tmp
+    && mkdir -p /app/data/clean /app/data/raw_sql /app/data/raw_parquet /app/data/raw /tmp/ojs_api_api_duckdb_tmp
 
 EXPOSE 8000
 

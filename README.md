@@ -48,7 +48,7 @@ Main outputs:
 
 - `data/raw_parquet/*.parquet`
 - `data/raw/jonied.parquet`
-- `clean/deduplicated.parquet`
+- `data/clean/deduplicated.parquet`
 
 Each major stage also writes a JSON summary sidecar.
 
@@ -202,8 +202,8 @@ python src/2_deduplicate.py
 
 What it writes:
 
-- `clean/deduplicated.parquet`
-- `clean/deduplicated.parquet.summary.json`
+- `data/clean/deduplicated.parquet`
+- `data/clean/deduplicated.parquet.summary.json`
 
 What the dedupe does:
 
@@ -254,7 +254,7 @@ Script:
 
 - [src/3_build_api.py](/home/jinx/Dropbox/ojs_api/src/3_build_api.py:1)
 
-This is a read-only FastAPI service over `clean/deduplicated.parquet`.
+This is a read-only FastAPI service over `data/clean/deduplicated.parquet`.
 
 Run locally:
 
@@ -266,7 +266,7 @@ By default it serves:
 
 - host: `127.0.0.1`
 - port: `8000`
-- input file: `clean/deduplicated.parquet`
+- input file: `data/clean/deduplicated.parquet`
 
 Default credentials:
 
@@ -471,7 +471,7 @@ Default command:
 docker compose up --build
 ```
 
-Compose mounts `./data` and `./clean` read-write into the container, so the pipeline outputs are persisted on the host.
+Compose mounts `./data` read-write into the container, so pipeline inputs and outputs are persisted on the host.
 
 Required host input before first run:
 
@@ -500,7 +500,7 @@ You can tune behavior with environment variables in `docker-compose.yml`:
 - `OJS_API_ARGS`: args for `3_build_api.py`
 - `OJS_FORCE_CONVERT=1`: force rerun step 0 even if required parquet files exist
 - `OJS_FORCE_JOIN=1`: force rerun step 1 even if `data/raw/jonied.parquet` exists
-- `OJS_FORCE_DEDUPE=1`: force rerun step 2 even if `clean/deduplicated.parquet` exists
+- `OJS_FORCE_DEDUPE=1`: force rerun step 2 even if `data/clean/deduplicated.parquet` exists
 
 Force a full recompute once:
 
@@ -510,7 +510,7 @@ OJS_FORCE_CONVERT=1 OJS_FORCE_JOIN=1 OJS_FORCE_DEDUPE=1 docker compose up --buil
 
 ### API-Only Container Mode
 
-If you already have `clean/deduplicated.parquet` and only want to serve the API:
+If you already have `data/clean/deduplicated.parquet` and only want to serve the API:
 
 ```bash
 docker run \
@@ -518,10 +518,10 @@ docker run \
   -p 8000:8000 \
   -e OJS_API_USERNAME=admin \
   -e OJS_API_PASSWORD=OJSpassword \
-  -v "$(pwd)/clean:/app/clean:ro" \
+  -v "$(pwd)/data/clean:/app/data/clean:ro" \
   ojs-api \
   python src/3_build_api.py \
-  --input /app/clean/deduplicated.parquet \
+  --input /app/data/clean/deduplicated.parquet \
   --host 0.0.0.0 \
   --port 8000
 ```
