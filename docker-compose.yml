@@ -1,0 +1,17 @@
+services:
+  ojs-api:
+    build: .
+    container_name: ojs-api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      OJS_API_USERNAME: admin
+      OJS_API_PASSWORD: OJSpassword
+      OJS_CONVERT_ARGS: --skip-existing --report-every 0 --progress-refresh-seconds 5
+      OJS_JOIN_ARGS: --overwrite
+      OJS_DEDUPE_ARGS: --overwrite
+      OJS_API_ARGS: --input /app/clean/deduplicated.parquet --host 0.0.0.0 --port 8000
+    volumes:
+      - ./data:/app/data
+      - ./clean:/app/clean
