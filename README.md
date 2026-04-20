@@ -170,6 +170,7 @@ Why it is safe:
 - uses an explicit projected column list instead of materializing whole source tables in Python
 - writes to a temp parquet first, then renames
 - defaults to `memory_limit=1GB`
+- runs streaming metadata unpacking in DuckDB `threads=1` safety mode by default to avoid native segfaults seen in some DuckDB/PyArrow environments
 - logs timestamped input and output shape/size stats
 - excludes `records.metadata` unless you opt in, which keeps the default flat file materially smaller
 - streams metadata-mode output in bounded Arrow batches instead of relying on one monolithic parquet export
@@ -183,6 +184,7 @@ Useful options:
 - `--stream-batch-rows N`
 - `--memory-limit TEXT`
 - `--threads N`
+- `--allow-parallel-streaming`
 - `--temp-dir PATH`
 - `--no-progress`
 
