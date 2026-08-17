@@ -1,0 +1,10 @@
+[Unit]
+Description=Check PKP Beacon for a new snapshot every day
+
+[Timer]
+OnCalendar=*-*-* 03:20:00
+Persistent=true
+RandomizedDelaySec=2h
+
+[Install]
+WantedBy=timers.target

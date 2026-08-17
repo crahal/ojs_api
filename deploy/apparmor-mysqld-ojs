@@ -1,0 +1,7 @@
+# Merge these rules into /etc/apparmor.d/local/usr.sbin.mysqld when the host
+# MySQL package enables AppArmor. They permit only the repository data tree and
+# the pipeline's private runtime directories; do not disable the whole profile.
+/srv/ojs_api/data/ rw,
+/srv/ojs_api/data/** rwk,
+/tmp/ojs-api-mysql-*/ rw,
+/tmp/ojs-api-mysql-*/** rwk,

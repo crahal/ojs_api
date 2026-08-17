@@ -1,0 +1,6 @@
+# Install this entry in the ojs account's crontab, not root's crontab.
+# Do not install it when ojs-api-update.timer is enabled.
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+17 3 * * * cd /srv/ojs_api && ./scripts/automatic_update.sh >> /srv/ojs_api/data/automatic-update.log 2>&1

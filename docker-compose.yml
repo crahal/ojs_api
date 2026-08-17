@@ -1,16 +1,81 @@
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "5"
+
 services:
+  mysql:
+    image: ${OJS_MYSQL_IMAGE:-mysql:8.4.0}
+    container_name: ojs-mysql
+    restart: unless-stopped
+    user: "${OJS_HOST_UID:?set OJS_HOST_UID}:${OJS_HOST_GID:?set OJS_HOST_GID}"
+    environment:
+      MYSQL_DATABASE: ${OJS_DB_NAME:-pkpbeacon_db}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?set MYSQL_ROOT_PASSWORD}
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_0900_ai_ci
+      - --skip-log-bin
+      - --innodb-buffer-pool-size=${OJS_SERVING_MYSQL_BUFFER_POOL_SIZE:-5G}
+      - --max-connections=${OJS_SERVING_MYSQL_MAX_CONNECTIONS:-50}
+      - --temptable-max-ram=${OJS_SERVING_MYSQL_TEMPTABLE_MAX_RAM:-256M}
+      - --tmp-table-size=64M
+      - --max-heap-table-size=64M
+    volumes:
+      - ./data/clean/mysql-current:/var/lib/mysql
+    tmpfs:
+      - /var/run/mysqld:size=16m,mode=1777
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$${MYSQL_ROOT_PASSWORD} --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+    stop_grace_period: 2m
+    mem_limit: ${OJS_SERVING_MYSQL_MEMORY_LIMIT:-7g}
+    mem_reservation: ${OJS_SERVING_MYSQL_MEMORY_RESERVATION:-5g}
+    memswap_limit: ${OJS_SERVING_MYSQL_MEMSWAP_LIMIT:-9g}
+    mem_swappiness: 10
+    pids_limit: 256
+    logging: *default-logging
+
   ojs-api:
-    build: .
+    build:
+      context: .
+      args:
+        PYTHON_IMAGE: ${OJS_PYTHON_IMAGE:-python:3.12.7-slim-bookworm}
     container_name: ojs-api
     restart: unless-stopped
+    user: "${OJS_HOST_UID:?set OJS_HOST_UID}:${OJS_HOST_GID:?set OJS_HOST_GID}"
+    depends_on:
+      mysql:
+        condition: service_healthy
     ports:
-      - "8000:8000"
+      - "127.0.0.1:${OJS_API_PORT:-8000}:8000"
     environment:
-      OJS_API_USERNAME: admin
-      OJS_API_PASSWORD: OJSpassword
-      OJS_CONVERT_ARGS: --skip-existing --report-every 0 --progress-refresh-seconds 5
-      OJS_JOIN_ARGS: --overwrite
-      OJS_DEDUPE_ARGS: --overwrite
-      OJS_API_ARGS: --input /app/data/clean/deduplicated.parquet --host 0.0.0.0 --port 8000
+      OJS_API_CREDENTIALS_FILE: /run/secrets/ojs-api-client.env
+      OJS_ADMIN_EMAIL: ${OJS_ADMIN_EMAIL:?set OJS_ADMIN_EMAIL}
+      OJS_PUBLIC_BASE_URL: ${OJS_PUBLIC_BASE_URL:?set OJS_PUBLIC_BASE_URL}
+      OJS_DB_HOST: mysql
+      OJS_DB_PORT: 3306
+      OJS_DB_NAME: ${OJS_DB_NAME:-pkpbeacon_db}
+      OJS_DB_USER: ${OJS_DB_API_USER:-ojs_api}
+      OJS_DB_PASSWORD_FILE: /run/secrets/ojs-db-api-password
+      OJS_OAI_PAGE_SIZE: ${OJS_OAI_PAGE_SIZE:-100}
     volumes:
-      - ./data:/app/data
+      - ${OJS_API_CREDENTIALS_HOST_FILE:-./.secrets/api-client.env}:/run/secrets/ojs-api-client.env:ro
+      - ${OJS_DB_API_PASSWORD_FILE:-./.secrets/db-api-password}:/run/secrets/ojs-db-api-password:ro
+    read_only: true
+    mem_limit: ${OJS_API_MEMORY_LIMIT:-512m}
+    memswap_limit: ${OJS_API_MEMSWAP_LIMIT:-768m}
+    mem_swappiness: 10
+    pids_limit: 128
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    init: true
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+    logging: *default-logging

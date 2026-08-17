@@ -137,6 +137,8 @@ celerybeat.pid
 # Environments
 .env
 .envrc
+.beacon-credentials
+.secrets/
 .venv
 env/
 venv/
@@ -206,5 +208,10 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 
-.data/*
+# Local data is intentionally outside git. Raw SQL versions live in data/raw/;
+# SQL-built outputs and MySQL files live in data/clean/.
 data/
+.codex
+.pipeline-test-*/
+.pipeline-*-test-*/
+.publish-live-test-*/

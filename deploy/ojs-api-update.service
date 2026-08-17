@@ -1,0 +1,35 @@
+[Unit]
+Description=Check and publish PKP Beacon data without API downtime
+Requires=docker.service
+After=network-online.target docker.service
+RequiresMountsFor=/srv/ojs_api/data
+
+[Service]
+Type=oneshot
+User=ojs
+Group=ojs
+WorkingDirectory=/srv/ojs_api
+EnvironmentFile=/srv/ojs_api/.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/srv/ojs_api/scripts/automatic_update.sh
+CPUWeight=25
+IOWeight=25
+MemoryHigh=5G
+MemoryMax=6G
+MemorySwapMax=2G
+TasksMax=256
+OOMScoreAdjust=500
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/srv/ojs_api/data
+TimeoutStartSec=4d
