@@ -760,7 +760,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--oai-page-size",
         type=int,
-        default=env_int("OJS_OAI_PAGE_SIZE", 500),
+        default=env_int("OJS_OAI_PAGE_SIZE", 50),
     )
     args = parser.parse_args()
     if not 1 <= args.port <= 65535 or not 1 <= args.db_port <= 65535:
@@ -896,6 +896,9 @@ def resolve_config(args: argparse.Namespace) -> APIConfig:
 
 
 def create_app(config: APIConfig) -> FastAPI:
+    max_page_size = env_int("OJS_API_MAX_PAGE_SIZE", 200)
+    if not 1 <= max_page_size <= 1000:
+        raise ValueError("OJS_API_MAX_PAGE_SIZE must be between 1 and 1000")
     backend = SQLBackend(config)
     security = HTTPBasic()
     app = FastAPI(
@@ -965,7 +968,7 @@ def create_app(config: APIConfig) -> FastAPI:
     @app.get("/articles", tags=["articles"])
     def articles(
         after_id: int = Query(0, ge=0),
-        limit: int = Query(100, ge=1, le=1000),
+        limit: int = Query(min(100, max_page_size), ge=1, le=max_page_size),
         article_status: str = Query("active", alias="status"),
         changed_since: str | None = Query(None),
         issn: str | None = Query(None),
@@ -1033,7 +1036,7 @@ def create_app(config: APIConfig) -> FastAPI:
     def sources(
         article_id: int,
         after_id: int = Query(0, ge=0),
-        limit: int = Query(100, ge=1, le=1000),
+        limit: int = Query(min(100, max_page_size), ge=1, le=max_page_size),
         _: str = Depends(require_auth),
     ) -> dict[str, Any]:
         if backend.article(
@@ -1051,7 +1054,7 @@ def create_app(config: APIConfig) -> FastAPI:
     @app.get("/changes", tags=["changes"])
     def changes(
         after_event_id: int = Query(0, ge=0),
-        limit: int = Query(100, ge=1, le=1000),
+        limit: int = Query(min(100, max_page_size), ge=1, le=max_page_size),
         structured_metadata: bool = Query(True),
         include_metadata_xml: bool = Query(False),
         _: str = Depends(require_auth),
@@ -1415,7 +1418,14 @@ def create_app(config: APIConfig) -> FastAPI:
 def main() -> int:
     args = parse_args()
     config = resolve_config(args)
-    uvicorn.run(create_app(config), host=args.host, port=args.port)
+    concurrency = env_int("OJS_API_CONCURRENCY", 8)
+    if not 2 <= concurrency <= 64:
+        raise ValueError("OJS_API_CONCURRENCY must be between 2 and 64")
+    uvicorn.run(
+        create_app(config), host=args.host, port=args.port,
+        workers=1, limit_concurrency=concurrency, backlog=32,
+        timeout_keep_alive=5,
+    )
     return 0
 
 

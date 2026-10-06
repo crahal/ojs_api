@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import gzip
+import hashlib
+import io
+import json
 import os
 import shutil
 import subprocess
@@ -379,6 +383,40 @@ CHAIN_DUMP = dump(
 
 
 class PipelineUnitTest(unittest.TestCase):
+    def test_compressed_snapshot_has_logical_size_hash_and_one_history_entry(self):
+        with TemporaryDirectory() as directory:
+            raw = Path(directory)
+            plain = raw / "pkpbeacon-2026-01-01.sql"
+            archive = raw / "pkpbeacon-2026-01-01.sql.gz"
+            content = JANUARY_DUMP.encode("utf-8")
+            plain.write_bytes(content)
+            archive.write_bytes(gzip.compress(content))
+            snapshot = run_pipeline.inspect_snapshot(archive)
+            self.assertEqual(snapshot.size, len(content))
+            self.assertEqual(
+                run_pipeline.snapshot_sha256(snapshot), hashlib.sha256(content).hexdigest()
+            )
+            self.assertEqual(run_pipeline.discover_snapshots(raw), [snapshot])
+            self.assertFalse((raw / "pkpbeacon-2026-01-01.sql.part").exists())
+
+    def test_compact_ddl_changes_only_records_storage_and_bounds_large_inserts(self):
+        content = JANUARY_DUMP.encode("utf-8") + b"INSERT INTO `records` VALUES ('" + b"x" * 200000 + b"');\n"
+        source = io.BytesIO(content)
+        transformer = run_pipeline.RawRecordsDDL()
+        output = bytearray()
+        while chunk := source.readline(64 * 1024):
+            output.extend(transformer.transform(chunk))
+        transformer.finish()
+        marker = b" ROW_FORMAT=COMPRESSED KEY_BLOCK_SIZE=8"
+        self.assertEqual(output.count(marker), 1)
+        self.assertEqual(bytes(output).replace(marker, b""), content)
+
+    def test_compact_ddl_rejects_unexpected_records_engine(self):
+        transformer = run_pipeline.RawRecordsDDL()
+        transformer.transform(b"CREATE TABLE `records` (\n")
+        with self.assertRaisesRegex(run_pipeline.PipelineError, "unsupported records"):
+            transformer.transform(b") ENGINE=MyISAM;\n")
+
     def test_snapshot_timestamp_must_match_filename(self):
         with TemporaryDirectory() as directory:
             path = Path(directory) / "pkpbeacon-2026-07-01.sql"
@@ -657,6 +695,30 @@ class PipelineIntegrationTest(unittest.TestCase):
                 0,
                 result.stdout + result.stderr,
             )
+
+            progress = [
+                json.loads(line.removeprefix("[progress] "))
+                for line in result.stderr.splitlines()
+                if line.startswith("[progress] ")
+            ]
+            passes = [event for event in progress if event["event"] == "dedup-pass"]
+            self.assertGreaterEqual(len(passes), 3)
+            self.assertEqual(
+                [event["pass_number"] for event in passes],
+                list(range(1, len(passes) + 1)),
+            )
+            self.assertGreater(passes[0]["changed_rows"], 0)
+            self.assertEqual(passes[-1]["changed_rows"], 0)
+            self.assertIn("source_indexes", [event.get("step") for event in progress])
+            extracted = [event["extracted_rows"] for event in progress if event["event"] == "metadata-rows"]
+            self.assertEqual(sum(extracted), 5)
+            completed = [
+                event for event in progress
+                if event["stage"] == "metadata-shard" and event["event"] == "completed"
+            ]
+            self.assertEqual(len(completed), len(extracted))
+            self.assertNotIn("fixture-password", result.stderr)
+            self.assertNotIn("<dc:", result.stderr)
 
             server = run_pipeline.MySQLServer(
                 run_pipeline.MySQLTools.discover(),
@@ -1245,6 +1307,28 @@ class PipelineIntegrationTest(unittest.TestCase):
 
     def test_temporal_history_add_modify_merge_remove_restore(self):
         project_root = Path(__file__).parents[1]
+        july_rows = fixture_rows(
+            alpha_title="Alpha Study Revised",
+            mirror_removed=True,
+            beta_doi="10.1234/delta",
+            epsilon_removed=True,
+            include_zeta=True,
+        )
+        # A publisher can correct XML without changing either source timestamp.
+        # The content hash must still produce the same modification event.
+        july_rows[0] = july_rows[0].replace(
+            "2026-07-01 00:00:00", "2026-01-01 00:00:00"
+        )
+        august_rows = fixture_rows(
+            alpha_title="Alpha Study Revised",
+            mirror_removed=True,
+            beta_doi="10.1234/delta",
+            epsilon_removed=False,
+            include_zeta=False,
+        )
+        august_rows[0] = august_rows[0].replace(
+            "2026-07-01 00:00:00", "2026-01-01 00:00:00"
+        )
         with TemporaryDirectory(
             dir=project_root,
             prefix=".pipeline-test-",
@@ -1254,11 +1338,11 @@ class PipelineIntegrationTest(unittest.TestCase):
             snapshots = []
             for version, content in (
                 ("2026-01-01", JANUARY_DUMP),
-                ("2026-07-01", JULY_DUMP),
-                ("2026-08-01", AUGUST_DUMP),
+                ("2026-07-01", dump("2026-07-01", july_rows)),
+                ("2026-08-01", dump("2026-08-01", august_rows)),
             ):
-                path = root / f"pkpbeacon-{version}.sql"
-                path.write_text(content, encoding="utf-8")
+                path = root / f"pkpbeacon-{version}.sql.gz"
+                path.write_bytes(gzip.compress(content.encode("utf-8")))
                 snapshots.append(path)
 
             env = os.environ.copy()
@@ -1278,6 +1362,7 @@ class PipelineIntegrationTest(unittest.TestCase):
                         "--metadata-workers",
                         "2",
                         "--allow-anomalous-release",
+                        "--compact-storage",
                         "--progress-seconds",
                         "1",
                     ],
@@ -1305,6 +1390,9 @@ class PipelineIntegrationTest(unittest.TestCase):
             )
 
             datadir = clean_dir / "mysql-2026-08-01"
+            marker = json.loads((datadir / "OJS_COMPACT_RELEASE.json").read_text())
+            self.assertTrue(marker["clean_only"])
+            self.assertEqual(marker["data_directory_name"], datadir.name)
             server = run_pipeline.MySQLServer(
                 run_pipeline.MySQLTools.discover(),
                 datadir,
@@ -1312,6 +1400,25 @@ class PipelineIntegrationTest(unittest.TestCase):
             )
             try:
                 server.start("fixture-password")
+                with self.assertRaisesRegex(run_pipeline.PipelineError, "still using|still has"):
+                    run_pipeline.assert_database_stopped(datadir)
+                table_rows = server.execute(
+                    "SELECT table_name FROM information_schema.tables "
+                    "WHERE table_schema = DATABASE();",
+                    database="pkpbeacon_db",
+                    password="fixture-password",
+                ).splitlines()
+                self.assertEqual(
+                    set(table_rows),
+                    set(run_pipeline.CLEAN_EXPORT_TABLES) | {"ojs_pipeline_metadata"},
+                )
+                row_format = server.execute(
+                    "SELECT row_format FROM information_schema.tables "
+                    "WHERE table_schema = DATABASE() AND table_name = 'ojs_articles';",
+                    database="pkpbeacon_db",
+                    password="fixture-password",
+                )
+                self.assertEqual(row_format.lower(), "compressed")
                 articles = server.execute(
                     """
                     SELECT
@@ -1344,6 +1451,17 @@ class PipelineIntegrationTest(unittest.TestCase):
                 )
             finally:
                 server.shutdown("fixture-password")
+
+            run_pipeline.verify_existing_database(
+                snapshot=run_pipeline.inspect_snapshot(snapshots[-1]),
+                datadir=datadir,
+                build_sql=project_root / "sql" / "01_build_ojs_tables.sql",
+                database="pkpbeacon_db",
+                root_password="fixture-password",
+                buffer_pool_size="128M",
+                progress_seconds=1,
+                verify_source_checksum=True,
+            )
 
             article_rows = articles.splitlines()
             self.assertIn("1\tactive\t0\t2\t2026-01-01\t2026-07-01\t", article_rows)

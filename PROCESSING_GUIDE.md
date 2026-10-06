@@ -1,6 +1,6 @@
 # How the Bibliometric Data Is Processed
 
-In one sentence: each dated MySQL dump is kept unchanged, compared with the
+In one sentence: each incoming MySQL dump is checked unchanged, compared with the
 previous clean release, converted into stable article records, audited for
 additions/changes/removals/merges, and published only after validation.
 
@@ -15,22 +15,22 @@ normally synchronize.
 
 ## What happens to a new file
 
-1. **Discover it.** The daily job checks either the PKP Beacon endpoint or the
-   configured HTML index. The index scraper looks for links named
-   `pkpbeacon-YYYY-MM-DD.sql` or `pkpbeacon-YYYY-MM-DD.sql.gz` and downloads
-   every missing dated file.
+1. **Discover it.** The daily cron checks the authenticated PKP Beacon gzip
+   endpoint. If its HTTP validators are unchanged, there is no download or
+   rebuild. An optional standalone HTML scraper is also available for archives.
 
-2. **Validate and retain it.** A gzip is expanded with a size limit. The file
-   must identify itself as a MySQL dump, and the completion date inside the
-   dump must equal the date in its filename. It is then stored read-only under
-   `data/raw/`; raw files are never edited.
+2. **Validate it without expanding it on disk.** Read the gzip in bounded
+   chunks, check its CRC, hash both compressed and SQL bytes, and read the SQL
+   completion date. Save one immutable `pkpbeacon-YYYY-MM-DD.sql.gz` with that
+   footer date. HTTP Last-Modified may differ; the saved metadata records the
+   relationship. Same-date changed bytes stop for review.
 
 3. **Process in date order.** If several files arrived, the oldest unprocessed
    file is processed first. A newly discovered file older than the published
    history is never silently skipped: the job stops and asks for a controlled
    history rebuild.
 
-4. **Build safely beside production.** The dump is imported into a new
+4. **Build safely beside production.** The gzip streams directly into a new
    `mysql-YYYY-MM-DD.building` directory. The current API database remains
    untouched. The immediately preceding clean SQL export is loaded to carry
    stable IDs and lifecycle history forward.
@@ -43,9 +43,10 @@ normally synchronize.
 6. **Extract and normalize metadata.** OAI/DC XML supplies title, creators,
    date, identifiers, DOI, article URL, and the other API fields. Normal monthly
    runs parse only new or changed source rows; `--full-rescan` reparses all rows
-   for an audit. Incremental correctness therefore assumes the source updates a
-   record timestamp/state field whenever its XML changes. Parsing is split into
-   indexed ID ranges and can run in parallel.
+   for an audit. Every source XML is hashed, so an edit is detected even if the
+   source forgot to update its timestamp. Parsing uses indexed ID ranges with
+   one worker on the small host; large XML and metadata tables use MySQL
+   compression, and temporary work can spill to disk.
 
 7. **Merge exact duplicates.** Matching is deterministic and exact—there is no
    fuzzy score:
@@ -85,9 +86,74 @@ normally synchronize.
     change report. Large unexpected source loss, article loss, removals, or
     merges block publication for human review. An atomic release manifest is
     written only after the database, export, report, and checksums are complete,
-    so an interrupted run is retried safely. A successful clean SQL release is
-    imported into a staging schema and all serving tables are swapped in one
-    atomic MySQL rename.
+    so an interrupted run is retried safely. Imported raw tables are dropped;
+    the database contains only the clean serving state. The coordinator briefly
+    stops MySQL/API, switches the serving directory, restarts and checks the
+    authenticated API. Failed checks restore the previous release.
+
+11. **Remove obsolete large artifacts.** Only after the new release works,
+    remove older managed raw gzips, exports and unmounted databases. Keep the
+    latest input, current database, one clean export for the next update, and
+    small audit reports. A temporary old/candidate pair is needed for recovery;
+    no third serving copy or expanded raw SQL file is created.
+
+## Reading build progress
+
+The production service records progress in the system journal. Reconnect over
+SSH at any time and run:
+
+```bash
+sudo journalctl -u ojs-api-update.service -f -o short-iso
+sudo journalctl -u ojs-api-update.service -n 50 --no-pager -o short-iso
+sudo journalctl -u ojs-api-update.service --since yesterday --no-pager -o short-iso
+```
+
+Each `[progress]` line contains one JSON object on stderr, flushed immediately.
+`timestamp` is UTC; `event` is `started`, `heartbeat`, `completed`, `failed` or
+a named milestone such as `sql-stage` or `dedup-pass`. `stage` identifies the
+operation; `step` identifies a SQL substage where known.
+`elapsed_seconds` is time spent in that stage. `idle_seconds` is time since
+that stage's last observed counter change or milestone, not the database's own
+idle time. An outer stage may show increasing idle time while a nested stage
+reports useful work.
+Where available, records include these measurements:
+
+| Measurement | Interpretation |
+| --- | --- |
+| `processed_bytes`, `total_bytes` where known | Download, validation, import, export or checksum work observed so far; streamed import bytes do not mean MySQL has committed those rows. |
+| Metadata ID range, batches and rows | Ranges actually examined and rows hashed/parsed; ID ranges can contain gaps, so ID position is not a row percentage. |
+| Named SQL stage | Wrangling, duplicate-key construction/filtering, graph initialization, canonical selection, lifecycle/event work or cleanup currently executing. |
+| `dedup-pass` event: `pass_number`, `changed_rows` | A completed label-propagation pass and rows it changed; these are convergence measurements, not a prediction of remaining passes. |
+| `process_pid`, `process_cpu_seconds`, `process_rss_bytes`, `disk_free_bytes` | Optional Linux resource samples to help interpret expensive stages; process samples are not the entire service's resource total. |
+
+For example, this illustrative record says pass 3 finished and changed 128 rows:
+
+```text
+[progress] {"timestamp":"2026-10-06T12:00:00+00:00","event":"dedup-pass","stage":"temporal finalization phase","step":"deduplication","elapsed_seconds":7200.0,"idle_seconds":0.0,"pass_number":3,"changed_rows":128}
+```
+
+Long SQL statements continue to produce periodic heartbeats. SQL progress comes
+only from allowlisted named markers and numeric pass/count fields; it does not
+print source rows, XML, SQL statements or passwords. Start/completion and named
+stage changes are reported immediately. Periodic output defaults to 30 seconds;
+set `OJS_PROGRESS_SECONDS` to a finite value from 1 through 3600 seconds in the
+private environment to change that interval.
+
+A heartbeat proves the reporting process is alive, not that useful work is
+advancing. A long single query may leave `idle_seconds` growing while CPU or
+I/O counters increase. Inspect the service's CPU/I/O, memory and disk alongside
+the log before diagnosing a stall; consistently unchanged counters and no
+CPU/I/O need investigation. The first full 4 GB build has not been benchmarked,
+so there is no measured whole-build ETA or honest global percentage. A stage's
+`completed` event also does not mean the release has passed its remaining gates
+or become live. A kill/reboot may prevent a final event: consult systemd status.
+
+The deployment journal policy retains bounded recent diagnostic history and
+may prune old logs before 14 days when its size budget is reached. It covers
+the host's default journal, including other services. Small checksummed audit
+reports below are retained separately from these progress logs. See
+[operations and resource checks](HOW_TO_DEPLOY.md#monitoring) and the
+[journal installation steps](LIGHTSAIL_DEPLOYMENT.md#6-build-the-api-image-and-install-the-bounded-service).
 
 ## Where changes are reported
 
@@ -100,7 +166,11 @@ For snapshot `YYYY-MM-DD`:
 - `pkpbeacon-release-YYYY-MM-DD.json` is the final completion marker binding the
   clean export and report checksums; files without it are not treated as a
   processed release.
-- `data/clean/pkpbeacon-changes-latest.json` points to the current report.
+- `data/clean/pkpbeacon-changes-latest.json` points to the latest completed
+  build's report. A completed build is not necessarily live yet: `GET /meta`
+  identifies the release currently served by the API.
+- `pkpbeacon-cleanup-YYYY-MM-DD.json` records generated files removed after a
+  successful release, including paths and byte counts.
 - `ojs_article_events` stores every API-visible event with stable article ID,
   before/after hashes, operation (`upsert` or `delete`), and reason.
 - `GET /changes?after_event_id=...` is the supported downstream cursor. It
@@ -120,18 +190,20 @@ make update
 make automatic-update
 
 # Reparse the complete history in a new, isolated audit directory
-python src/run_pipeline.py --skip-download --clean-dir data/audit-clean \
-  --rebuild-history --full-rescan --force-rebuild
+python3 src/run_pipeline.py --skip-download --clean-dir data/audit-clean \
+  --compact-storage --rebuild-history --full-rescan --force-rebuild
 
 # Verify the current database, export, provenance, report, and checksums
 make verify
 ```
 
 `data/audit-clean` must be new and must have enough space for a second build.
-Using a separate directory keeps the serving `mysql-current` database and its
+Restore any pruned historical raw files from a deliberate backup first. Older
+event history stays in the current database, but old raw files are not kept
+indefinitely. Using a separate directory keeps the serving `mysql-live` database and its
 release pointers untouched while the audit is running.
 
-The implementation is split between `src/scrape_updates.py` (discovery),
+The implementation is split between `src/download_beacon.py` (discovery/download),
 `src/run_pipeline.py` (orchestration and reports),
 `sql/01_build_ojs_tables.sql` (bibliometric transformation), and
-`src/publish_live.py` (atomic live publication).
+`src/compact_update.py` (verified live publication and bounded retention).

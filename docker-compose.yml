@@ -1,8 +1,8 @@
 x-logging: &default-logging
   driver: json-file
   options:
-    max-size: "20m"
-    max-file: "5"
+    max-size: "5m"
+    max-file: "2"
 
 services:
   mysql:
@@ -17,13 +17,17 @@ services:
       - --character-set-server=utf8mb4
       - --collation-server=utf8mb4_0900_ai_ci
       - --skip-log-bin
-      - --innodb-buffer-pool-size=${OJS_SERVING_MYSQL_BUFFER_POOL_SIZE:-5G}
-      - --max-connections=${OJS_SERVING_MYSQL_MAX_CONNECTIONS:-50}
-      - --temptable-max-ram=${OJS_SERVING_MYSQL_TEMPTABLE_MAX_RAM:-256M}
-      - --tmp-table-size=64M
-      - --max-heap-table-size=64M
+      - --innodb-buffer-pool-size=${OJS_SERVING_MYSQL_BUFFER_POOL_SIZE:-512M}
+      - --max-connections=${OJS_SERVING_MYSQL_MAX_CONNECTIONS:-16}
+      - --temptable-max-ram=${OJS_SERVING_MYSQL_TEMPTABLE_MAX_RAM:-64M}
+      - --tmp-table-size=16M
+      - --max-heap-table-size=16M
+      - --innodb-redo-log-capacity=256M
+      - --mysqlx=0
+      - --local-infile=0
+      - --secure-file-priv=NULL
     volumes:
-      - ./data/clean/mysql-current:/var/lib/mysql
+      - ${OJS_LIVE_DATA_DIR:-./data/clean/mysql-live}:/var/lib/mysql
     tmpfs:
       - /var/run/mysqld:size=16m,mode=1777
     healthcheck:
@@ -32,9 +36,9 @@ services:
       timeout: 5s
       retries: 30
     stop_grace_period: 2m
-    mem_limit: ${OJS_SERVING_MYSQL_MEMORY_LIMIT:-7g}
-    mem_reservation: ${OJS_SERVING_MYSQL_MEMORY_RESERVATION:-5g}
-    memswap_limit: ${OJS_SERVING_MYSQL_MEMSWAP_LIMIT:-9g}
+    mem_limit: ${OJS_SERVING_MYSQL_MEMORY_LIMIT:-1024m}
+    mem_reservation: ${OJS_SERVING_MYSQL_MEMORY_RESERVATION:-512m}
+    memswap_limit: ${OJS_SERVING_MYSQL_MEMSWAP_LIMIT:-1536m}
     mem_swappiness: 10
     pids_limit: 256
     logging: *default-logging
@@ -43,7 +47,7 @@ services:
     build:
       context: .
       args:
-        PYTHON_IMAGE: ${OJS_PYTHON_IMAGE:-python:3.12.7-slim-bookworm}
+        PYTHON_IMAGE: ${OJS_PYTHON_IMAGE:-python:3.12.15-slim-bookworm}
     container_name: ojs-api
     restart: unless-stopped
     user: "${OJS_HOST_UID:?set OJS_HOST_UID}:${OJS_HOST_GID:?set OJS_HOST_GID}"
@@ -61,13 +65,15 @@ services:
       OJS_DB_NAME: ${OJS_DB_NAME:-pkpbeacon_db}
       OJS_DB_USER: ${OJS_DB_API_USER:-ojs_api}
       OJS_DB_PASSWORD_FILE: /run/secrets/ojs-db-api-password
-      OJS_OAI_PAGE_SIZE: ${OJS_OAI_PAGE_SIZE:-100}
+      OJS_OAI_PAGE_SIZE: ${OJS_OAI_PAGE_SIZE:-50}
+      OJS_API_MAX_PAGE_SIZE: ${OJS_API_MAX_PAGE_SIZE:-200}
+      OJS_API_CONCURRENCY: ${OJS_API_CONCURRENCY:-8}
     volumes:
       - ${OJS_API_CREDENTIALS_HOST_FILE:-./.secrets/api-client.env}:/run/secrets/ojs-api-client.env:ro
       - ${OJS_DB_API_PASSWORD_FILE:-./.secrets/db-api-password}:/run/secrets/ojs-db-api-password:ro
     read_only: true
-    mem_limit: ${OJS_API_MEMORY_LIMIT:-512m}
-    memswap_limit: ${OJS_API_MEMSWAP_LIMIT:-768m}
+    mem_limit: ${OJS_API_MEMORY_LIMIT:-256m}
+    memswap_limit: ${OJS_API_MEMSWAP_LIMIT:-384m}
     mem_swappiness: 10
     pids_limit: 128
     tmpfs:

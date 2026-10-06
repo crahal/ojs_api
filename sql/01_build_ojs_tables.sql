@@ -17,6 +17,10 @@ SET SESSION group_concat_max_len = 1073741824;
 SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;
 SET SESSION sql_mode = 'STRICT_TRANS_TABLES,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION';
 
+-- Progress rows contain only fixed stage names and numeric counters. The runner
+-- streams this allowlisted protocol and discards every other SQL result row.
+SELECT 'OJS_PROGRESS_V1', 'stage', 'schema';
+
 CREATE TABLE IF NOT EXISTS ojs_snapshots (
     snapshot_date DATE NOT NULL,
     dump_completed_at DATETIME NOT NULL,
@@ -81,7 +85,7 @@ CREATE TABLE IF NOT EXISTS ojs_articles (
     INDEX idx_ojs_articles_doi (doi),
     INDEX idx_ojs_articles_issn_id (journal_issn, article_id),
     INDEX idx_ojs_articles_merged_into (merged_into_article_id)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+) ENGINE=InnoDB /* OJS_COMPACT_TABLE */ DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
 CREATE TABLE IF NOT EXISTS ojs_article_sources (
     source_record_id BIGINT UNSIGNED NOT NULL,
@@ -115,7 +119,7 @@ CREATE TABLE IF NOT EXISTS ojs_article_sources (
     url_key_hash BINARY(32) NULL,
     fingerprint_key_hash BINARY(32) NULL,
     PRIMARY KEY (source_record_id)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+) ENGINE=InnoDB /* OJS_COMPACT_TABLE */ DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
 CREATE TABLE IF NOT EXISTS ojs_article_keys (
     key_type VARCHAR(16) NOT NULL,
@@ -125,7 +129,7 @@ CREATE TABLE IF NOT EXISTS ojs_article_keys (
     date_added DATE NOT NULL,
     PRIMARY KEY (key_type, key_hash),
     INDEX idx_ojs_keys_article (article_id, key_type)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+) ENGINE=InnoDB /* OJS_COMPACT_TABLE */ DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
 CREATE TABLE IF NOT EXISTS ojs_article_events (
     event_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
@@ -177,6 +181,7 @@ SET @ojs_full_rescan = COALESCE(@ojs_full_rescan, 0);
 
 -- Reduce contexts to one deterministic, normalized ISSN. This preserves the
 -- project's original scope: records from contexts represented in the ISSN table.
+SELECT 'OJS_PROGRESS_V1', 'stage', 'context_normalization';
 DROP TABLE IF EXISTS ojs_stage_contexts;
 CREATE TABLE ojs_stage_contexts (
     context_id BIGINT UNSIGNED NOT NULL,
@@ -228,9 +233,10 @@ GROUP BY
     e.oai_url
 HAVING journal_issn IS NOT NULL;
 
--- The compact source index is scanned every month. The large XML payload is
--- parsed only for new or changed rows, based on Beacon/OAI timestamps and
--- source-state fields retained from the prior clean snapshot.
+-- Read and hash source XML once per snapshot, including records whose Beacon
+-- timestamps did not advance. Parse and stage wide XML only when its bytes or
+-- source state changed; this keeps correctness without duplicating every row.
+SELECT 'OJS_PROGRESS_V1', 'stage', 'source_index';
 DROP TABLE IF EXISTS ojs_stage_source_index;
 CREATE TABLE ojs_stage_source_index (
     source_record_id BIGINT UNSIGNED NOT NULL,
@@ -301,6 +307,7 @@ SELECT
         OR NOT (prior.record_modified_at <=> r.modified_at)
         OR NOT (prior.source_removed_at <=> r.removed_at)
         OR prior.is_active <> (r.removed_at IS NULL)
+        OR NOT (prior.metadata_hash <=> UNHEX(SHA2(r.metadata, 256)))
     )
 FROM records r FORCE INDEX (records_context_id_identifier_unique)
 INNER JOIN ojs_stage_contexts c
@@ -312,6 +319,7 @@ LEFT JOIN ojs_article_sources prior
 -- ID for a different context/endpoint/source identifier would silently attach
 -- unrelated metadata to a published article, so quarantine that snapshot
 -- instead of guessing which identity should win.
+SELECT 'OJS_PROGRESS_V1', 'stage', 'source_identity_validation';
 DROP PROCEDURE IF EXISTS ojs_assert_source_identity;
 DELIMITER //
 CREATE PROCEDURE ojs_assert_source_identity()
@@ -382,9 +390,10 @@ CREATE TABLE ojs_stage_sources (
     url_key_hash BINARY(32) NULL,
     fingerprint_key_hash BINARY(32) NULL,
     PRIMARY KEY (source_record_id)
-) ENGINE=InnoDB;
+) ENGINE=InnoDB /* OJS_COMPACT_TABLE */;
 
 -- OJS_PIPELINE_METADATA_BEGIN
+SELECT 'OJS_PROGRESS_V1', 'stage', 'metadata_extraction';
 INSERT INTO ojs_stage_sources (
     source_record_id,
     context_id,
@@ -670,11 +679,14 @@ FROM (
         ) extracted
     ) keyed
 ) normalized;
+SET @ojs_metadata_rows = ROW_COUNT();
+SELECT 'OJS_PROGRESS_V1', 'metadata_rows', @ojs_metadata_rows;
 -- OJS_PIPELINE_METADATA_END
 
 -- Materialize all available exact keys. High-frequency blocks are discarded
 -- before label propagation to prevent a malformed metadata value from creating
 -- a giant false-positive cluster.
+SELECT 'OJS_PROGRESS_V1', 'stage', 'exact_keys';
 DROP TABLE IF EXISTS ojs_stage_keys;
 CREATE TABLE ojs_stage_keys (
     source_record_id BIGINT UNSIGNED NOT NULL,
@@ -710,6 +722,7 @@ WHERE fingerprint_key_hash IS NOT NULL;
 -- plus every retained alias. Staged rows replace (rather than append to) their
 -- prior keys, which retires corrected DOI/OAI/URL/fingerprint values from all
 -- future candidate matching without attempting to split an established merge.
+SELECT 'OJS_PROGRESS_V1', 'stage', 'effective_keys';
 DROP TABLE IF EXISTS ojs_stage_effective_keys;
 CREATE TABLE ojs_stage_effective_keys (
     source_record_id BIGINT UNSIGNED NOT NULL,
@@ -808,6 +821,7 @@ LEFT JOIN ojs_article_keys identity_key
     ON identity_key.key_type = retained.key_type
    AND identity_key.key_hash = retained.key_hash;
 
+SELECT 'OJS_PROGRESS_V1', 'stage', 'noisy_keys';
 DROP TABLE IF EXISTS ojs_stage_noisy_keys;
 CREATE TABLE ojs_stage_noisy_keys (
     key_type VARCHAR(16) NOT NULL,
@@ -830,6 +844,7 @@ HAVING
 -- persistent lookup can be reconciled after source assignments are committed.
 -- Keeping the original date/value where possible makes that reconciliation
 -- stable and avoids converting the lookup itself into an append-only history.
+SELECT 'OJS_PROGRESS_V1', 'stage', 'touched_keys';
 DROP TABLE IF EXISTS ojs_stage_touched_keys;
 CREATE TABLE ojs_stage_touched_keys (
     key_type VARCHAR(16) NOT NULL,
@@ -925,6 +940,7 @@ INNER JOIN ojs_stage_noisy_keys noisy
     ON noisy.key_type = k.key_type
    AND noisy.key_hash = k.key_hash;
 
+SELECT 'OJS_PROGRESS_V1', 'stage', 'existing_candidates';
 DROP TABLE IF EXISTS ojs_stage_existing_candidates;
 CREATE TABLE ojs_stage_existing_candidates (
     source_record_id BIGINT UNSIGNED NOT NULL,
@@ -954,6 +970,7 @@ INNER JOIN ojs_stage_effective_keys existing_alias
    AND existing_alias.key_hash = staged_key.key_hash
 WHERE existing_alias.article_id IS NOT NULL;
 
+SELECT 'OJS_PROGRESS_V1', 'stage', 'initial_assignments';
 DROP TABLE IF EXISTS ojs_stage_assignments;
 CREATE TABLE ojs_stage_assignments (
     source_record_id BIGINT UNSIGNED NOT NULL,
@@ -992,6 +1009,7 @@ GROUP BY staged.source_record_id;
 
 -- Label propagation computes connected components inside the changed batch
 -- using indexed key blocks. It never compares unrelated records.
+SELECT 'OJS_PROGRESS_V1', 'stage', 'deduplication';
 DROP TABLE IF EXISTS ojs_stage_key_labels;
 CREATE TABLE ojs_stage_key_labels (
     key_type VARCHAR(16) NOT NULL,
@@ -1105,6 +1123,7 @@ BEGIN
 
     SET changed_rows = ROW_COUNT();
     SET pass_number = 1;
+    SELECT 'OJS_PROGRESS_V1', 'dedup_pass', pass_number, changed_rows;
 
     -- Later passes propagate only labels changed in the preceding pass. This
     -- preserves connected-component semantics without rebuilding the complete
@@ -1194,6 +1213,7 @@ BEGIN
             has_existing_article_id
         FROM ojs_stage_next_frontier;
         SET pass_number = pass_number + 1;
+        SELECT 'OJS_PROGRESS_V1', 'dedup_pass', pass_number, changed_rows;
     END WHILE;
 
     IF changed_rows > 0 THEN
@@ -1210,6 +1230,7 @@ DROP PROCEDURE ojs_propagate_labels;
 
 -- Existing entities bridged by a new/changed source are merged into the oldest
 -- stable article ID. Loser IDs remain permanent tombstones with a redirect.
+SELECT 'OJS_PROGRESS_V1', 'stage', 'article_merges';
 DROP TABLE IF EXISTS ojs_stage_merge_map;
 CREATE TABLE ojs_stage_merge_map (
     old_article_id BIGINT UNSIGNED NOT NULL,
@@ -1368,6 +1389,7 @@ WHERE source_alias.is_present = 1
 
 -- Sources absent from the latest full snapshot become inactive aliases. The
 -- canonical article is removed only later, after all its aliases are inactive.
+SELECT 'OJS_PROGRESS_V1', 'stage', 'source_reconciliation';
 UPDATE ojs_article_sources source_alias
 LEFT JOIN ojs_stage_source_index current_source
     ON current_source.source_record_id = source_alias.source_record_id
@@ -1508,6 +1530,7 @@ ON DUPLICATE KEY UPDATE
 -- indexes together afterward instead of maintaining them row by row. Imported
 -- clean history already has the complete index set, so incremental runs skip
 -- this ALTER and retain indexed source lookups throughout.
+SELECT 'OJS_PROGRESS_V1', 'stage', 'source_indexes';
 DROP PROCEDURE IF EXISTS ojs_ensure_source_indexes;
 DELIMITER //
 CREATE PROCEDURE ojs_ensure_source_indexes()
@@ -1695,6 +1718,7 @@ DROP PROCEDURE ojs_ensure_source_indexes;
 -- then rebuild only touched lookup entries. A corrected key is removed when no
 -- retained alias still supplies it. Globally noisy or multi-owner keys are
 -- deliberately omitted so they cannot create future accidental merges.
+SELECT 'OJS_PROGRESS_V1', 'stage', 'key_reconciliation';
 UPDATE ojs_stage_effective_keys effective
 INNER JOIN ojs_article_sources source_alias
     ON source_alias.source_record_id = effective.source_record_id
@@ -1736,6 +1760,7 @@ HAVING COUNT(DISTINCT effective.article_id) = 1
 
 -- Rank source aliases only for affected articles. Unchanged canonical payloads
 -- are retained byte-for-byte and never reparsed.
+SELECT 'OJS_PROGRESS_V1', 'stage', 'article_rollup';
 DROP TABLE IF EXISTS ojs_stage_article_rollup;
 CREATE TABLE ojs_stage_article_rollup (
     article_id BIGINT UNSIGNED NOT NULL,
@@ -1841,6 +1866,7 @@ INNER JOIN (
 ) ranked
     ON ranked.article_id = grouped.article_id;
 
+SELECT 'OJS_PROGRESS_V1', 'stage', 'canonical_payload';
 DROP TABLE IF EXISTS ojs_stage_payload_needed;
 CREATE TABLE ojs_stage_payload_needed (
     article_id BIGINT UNSIGNED NOT NULL,
@@ -1927,7 +1953,7 @@ CREATE TABLE ojs_stage_canonical_payload (
     metadata_hash BINARY(32) NULL,
     data_hash BINARY(32) NOT NULL,
     PRIMARY KEY (article_id)
-) ENGINE=InnoDB;
+) ENGINE=InnoDB /* OJS_COMPACT_TABLE */;
 
 INSERT INTO ojs_stage_canonical_payload
 SELECT
@@ -2059,6 +2085,11 @@ LEFT JOIN ojs_stage_sources staged
     ON staged.source_record_id = needed.source_record_id
 WHERE staged.source_record_id IS NULL;
 
+-- Canonical payloads now own every XML value needed by the remaining phase.
+-- Release the largest temporary copy before materializing next article state.
+DROP TABLE ojs_stage_sources;
+
+SELECT 'OJS_PROGRESS_V1', 'stage', 'article_state';
 DROP TABLE IF EXISTS ojs_stage_article_next;
 CREATE TABLE ojs_stage_article_next LIKE ojs_articles;
 
@@ -2168,6 +2199,9 @@ LEFT JOIN ojs_articles existing
 LEFT JOIN ojs_stage_canonical_payload payload
     ON payload.article_id = rollup.article_id;
 
+DROP TABLE ojs_stage_canonical_payload;
+
+SELECT 'OJS_PROGRESS_V1', 'stage', 'article_events';
 INSERT INTO ojs_article_events (
     snapshot_date,
     article_id,
@@ -2237,6 +2271,7 @@ WHERE existing.article_id IS NULL
    OR NOT (existing.provenance_hash <=> next_state.provenance_hash)
 ORDER BY next_state.article_id;
 
+SELECT 'OJS_PROGRESS_V1', 'stage', 'article_updates';
 INSERT INTO ojs_articles
 SELECT next_state.*
 FROM ojs_stage_article_next next_state
@@ -2293,6 +2328,7 @@ WHERE existing.status <> next_state.status
    OR NOT (existing.data_hash <=> next_state.data_hash)
    OR NOT (existing.provenance_hash <=> next_state.provenance_hash);
 
+SELECT 'OJS_PROGRESS_V1', 'stage', 'snapshot_counts';
 INSERT INTO ojs_snapshots (
     snapshot_date,
     dump_completed_at,
@@ -2331,6 +2367,7 @@ SELECT
         WHERE snapshot_date = @ojs_snapshot_date
     );
 
+SELECT 'OJS_PROGRESS_V1', 'stage', 'stage_cleanup';
 DROP TABLE IF EXISTS ojs_stage_article_next;
 DROP TABLE IF EXISTS ojs_stage_canonical_payload;
 DROP TABLE IF EXISTS ojs_stage_payload_needed;
@@ -2351,3 +2388,4 @@ DROP TABLE IF EXISTS ojs_stage_keys;
 DROP TABLE IF EXISTS ojs_stage_sources;
 DROP TABLE IF EXISTS ojs_stage_source_index;
 DROP TABLE IF EXISTS ojs_stage_contexts;
+SELECT 'OJS_PROGRESS_V1', 'stage', 'sql_complete';

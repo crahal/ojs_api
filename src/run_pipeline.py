@@ -16,6 +16,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -23,18 +24,21 @@ from datetime import datetime
 from pathlib import Path
 from typing import BinaryIO, Callable
 
+from download_beacon import validate_cached_snapshot
+from progress_logging import Progress, progress_interval
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_RAW_DIR = PROJECT_ROOT / "data" / "raw"
 DEFAULT_CLEAN_DIR = PROJECT_ROOT / "data" / "clean"
 DEFAULT_BUILD_SQL = PROJECT_ROOT / "sql" / "01_build_ojs_tables.sql"
 DEFAULT_DATABASE = "pkpbeacon_db"
-PIPELINE_VERSION = "2"
+PIPELINE_VERSION = "3"
 BUFFER_SIZE = 8 * 1024 * 1024
 METADATA_SHARDS_PER_WORKER = 32
 METADATA_BEGIN_MARKER = "-- OJS_PIPELINE_METADATA_BEGIN"
 METADATA_END_MARKER = "-- OJS_PIPELINE_METADATA_END"
 BUILD_STATE_NAME = "OJS_PIPELINE_STATE.json"
-SNAPSHOT_NAME_RE = re.compile(r"pkpbeacon-(\d{4}-\d{2}-\d{2})\.sql$")
+SNAPSHOT_NAME_RE = re.compile(r"pkpbeacon-(\d{4}-\d{2}-\d{2})\.sql(?:\.gz)?$")
 CLEAN_EXPORT_NAME_RE = re.compile(
     r"pkpbeacon-clean-(\d{4}-\d{2}-\d{2})\.sql\.gz$"
 )
@@ -56,10 +60,109 @@ API_READ_TABLES = (
 )
 CHANGE_EVENT_TYPES = ("added", "modified", "removed", "restored", "merged")
 CHANGE_OPERATIONS = ("upsert", "delete")
+SQL_PROGRESS_STAGES = frozenset({
+    "schema", "context_normalization", "source_index",
+    "source_identity_validation", "metadata_extraction", "exact_keys",
+    "effective_keys", "noisy_keys", "touched_keys", "existing_candidates",
+    "initial_assignments", "deduplication", "article_merges",
+    "source_reconciliation", "source_indexes", "key_reconciliation",
+    "article_rollup", "canonical_payload", "article_state", "article_events",
+    "article_updates", "snapshot_counts", "stage_cleanup", "sql_complete",
+})
+SAFE_SQL_ERRORS = (
+    "source record ID was reused with a different identity tuple",
+    "identity labels did not converge within 64 passes",
+    "snapshot has already been applied to the clean catalogue",
+    "@ojs_snapshot_date must be set by the pipeline",
+)
+
+
+def consume_sql_progress(line: bytes, progress: Progress) -> None:
+    """Forward only complete protocol rows; SQL results are never log messages."""
+    fields = line.rstrip(b"\r\n").split(b"\t")
+    if len(fields) < 3 or fields[0] != b"OJS_PROGRESS_V1":
+        return
+    if fields[1] == b"stage" and len(fields) == 3:
+        stage = fields[2].decode("ascii", errors="replace")
+        if stage in SQL_PROGRESS_STAGES:
+            progress.event("sql-stage", step=stage)
+    elif fields[1] == b"dedup_pass" and len(fields) == 4:
+        if all(re.fullmatch(rb"[0-9]{1,20}", item) for item in fields[2:]):
+            pass_number, changed_rows = map(int, fields[2:])
+            if 1 <= pass_number <= 64:
+                progress.event(
+                    "dedup-pass", step="deduplication",
+                    pass_number=pass_number, changed_rows=changed_rows,
+                )
+    elif fields[1] == b"metadata_rows" and len(fields) == 3:
+        if re.fullmatch(rb"[0-9]{1,20}", fields[2]):
+            progress.event("metadata-rows", extracted_rows=int(fields[2]))
+
+
+def bounded_lines(stream: BinaryIO):
+    """Discard oversized lines without allocating memory proportional to output."""
+    oversized = False
+    while fragment := stream.readline(512):
+        complete = fragment.endswith(b"\n")
+        if complete and not oversized:
+            yield fragment
+        oversized = not complete
+
+
+def safe_mysql_error(line: bytes) -> str | None:
+    match = re.match(rb"ERROR ([0-9]{1,5})(?: \([A-Z0-9]{5}\))?(?: at line ([0-9]{1,10}))?:", line)
+    if not match:
+        return None
+    detail = f"mysql_error={int(match[1])}"
+    if match[2]:
+        detail += f" sql_line={int(match[2])}"
+    for message in SAFE_SQL_ERRORS:
+        if message.encode("ascii") in line:
+            detail += f" ({message})"
+            break
+    return detail
+
+
+def stop_process(process: subprocess.Popen) -> None:
+    if process.poll() is None:
+        try:
+            process.terminate()
+        except ProcessLookupError:
+            return
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
 
 
 class PipelineError(RuntimeError):
     pass
+
+
+class PipelineInterrupted(KeyboardInterrupt):
+    def __init__(self, signum: int) -> None:
+        self.signum = signum
+        super().__init__(f"signal {signum}")
+
+
+@contextmanager
+def interruptible_pipeline():
+    """Turn termination into normal cleanup; repeated signals cannot break it."""
+    previous = {}
+    if threading.current_thread() is threading.main_thread():
+        def interrupted(signum, frame):
+            for watched in (signal.SIGINT, signal.SIGTERM):
+                signal.signal(watched, signal.SIG_IGN)
+            raise PipelineInterrupted(signum)
+
+        for watched in (signal.SIGINT, signal.SIGTERM):
+            previous[watched] = signal.signal(watched, interrupted)
+    try:
+        yield
+    finally:
+        for watched, handler in previous.items():
+            signal.signal(watched, handler)
 
 
 @dataclass(frozen=True)
@@ -167,9 +270,26 @@ def inspect_snapshot(path: Path) -> Snapshot:
     name_match = SNAPSHOT_NAME_RE.fullmatch(resolved.name)
     if not name_match:
         raise PipelineError(
-            "snapshot name must use pkpbeacon-YYYY-MM-DD.sql: "
+            "snapshot name must use pkpbeacon-YYYY-MM-DD.sql[.gz]: "
             f"{resolved.name}"
         )
+
+    if resolved.name.endswith(".gz"):
+        try:
+            metadata = validate_cached_snapshot(resolved)
+            completed_at = datetime.strptime(
+                metadata["dump_datetime"], "%Y-%m-%d %H:%M:%S"
+            )
+            size = int(metadata["uncompressed_size"])
+        except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
+            raise PipelineError(f"invalid compressed snapshot {resolved}: {exc}") from exc
+        version = completed_at.date().isoformat()
+        if name_match.group(1) != version:
+            raise PipelineError(
+                f"snapshot filename date {name_match.group(1)} does not match "
+                f"dump timestamp {version}"
+            )
+        return Snapshot(resolved, version, completed_at, size)
 
     size = resolved.stat().st_size
     with resolved.open("rb") as source:
@@ -203,13 +323,35 @@ def inspect_snapshot(path: Path) -> Snapshot:
 
 
 def discover_snapshots(raw_dir: Path, through: str | None = None) -> list[Snapshot]:
-    snapshots: list[Snapshot] = []
-    for path in raw_dir.glob("pkpbeacon-????-??-??.sql"):
+    snapshots: dict[str, Snapshot] = {}
+    for path in sorted(raw_dir.glob("pkpbeacon-????-??-??.sql*")):
         match = SNAPSHOT_NAME_RE.fullmatch(path.name)
         if match is None or (through is not None and match.group(1) > through):
             continue
-        snapshots.append(inspect_snapshot(path))
-    return sorted(snapshots, key=lambda item: item.version)
+        # Prefer the archive when both representations of a date exist.
+        snapshots[match.group(1)] = inspect_snapshot(path)
+    return sorted(snapshots.values(), key=lambda item: item.version)
+
+
+def open_snapshot(path: Path) -> BinaryIO:
+    return gzip.open(path, "rb") if path.name.endswith(".gz") else path.open("rb")
+
+
+def snapshot_sha256(snapshot: Snapshot, progress_seconds: float = 30) -> str:
+    """Hash logical SQL bytes, independent of their storage representation."""
+    digest = hashlib.sha256()
+    processed = 0
+    with Progress(
+        "snapshot-checksum", interval=progress_seconds,
+        total_bytes=snapshot.size, processed_bytes=0, disk_path=snapshot.path.parent,
+    ) as progress, open_snapshot(snapshot.path) as source:
+        while chunk := source.read(BUFFER_SIZE):
+            digest.update(chunk)
+            processed += len(chunk)
+            progress.update(processed_bytes=processed)
+        if processed != snapshot.size:
+            raise PipelineError("snapshot size changed while hashing logical SQL")
+    return digest.hexdigest()
 
 
 def release_manifest_path(clean_dir: Path, version: str) -> Path:
@@ -282,23 +424,20 @@ def sha256_file(path: Path, progress_seconds: float = 30) -> str:
     digest = hashlib.sha256()
     total = path.stat().st_size
     processed = 0
-    last_report = time.monotonic()
-    with path.open("rb") as source:
+    with Progress(
+        "file-checksum", interval=progress_seconds, total_bytes=total,
+        processed_bytes=0, disk_path=path.parent,
+    ) as progress, path.open("rb") as source:
         while chunk := source.read(BUFFER_SIZE):
             digest.update(chunk)
             processed += len(chunk)
-            now = time.monotonic()
-            if now - last_report >= progress_seconds:
-                print(
-                    f"[checksum] {format_bytes(processed)} / "
-                    f"{format_bytes(total)} ({processed / total * 100:.1f}%)"
-                )
-                last_report = now
-    print(f"[checksum] {format_bytes(total)} (100.0%)")
+            progress.update(processed_bytes=processed)
     return digest.hexdigest()
 
 
-def sha256_small_file(path: Path) -> str:
+def sha256_small_file(path: Path, progress_seconds: float | None = None) -> str:
+    if path.stat().st_size > BUFFER_SIZE:
+        return sha256_file(path, progress_interval(progress_seconds))
     digest = hashlib.sha256()
     with path.open("rb") as source:
         while chunk := source.read(BUFFER_SIZE):
@@ -306,8 +445,12 @@ def sha256_small_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def split_build_sql(path: Path) -> BuildSQLParts:
+def split_build_sql(path: Path, compact_storage: bool = False) -> BuildSQLParts:
     sql = path.read_text(encoding="utf-8")
+    sql = sql.replace(
+        "/* OJS_COMPACT_TABLE */",
+        "ROW_FORMAT=COMPRESSED KEY_BLOCK_SIZE=8" if compact_storage else "",
+    )
     if sql.count(METADATA_BEGIN_MARKER) != 1:
         raise PipelineError(
             f"{path.name} must contain exactly one {METADATA_BEGIN_MARKER}"
@@ -357,16 +500,64 @@ def command_error(
     )
 
 
+class RawRecordsDDL:
+    """Change only the small, line-oriented mysqldump records declaration.
+
+    Input arrives in bounded readline fragments; extended INSERT statements
+    are forwarded untouched, even when a single line is many megabytes long.
+    Unexpected records DDL fails closed instead of silently losing compression.
+    """
+
+    def __init__(self) -> None:
+        self.line_start = True
+        self.in_records = False
+        self.complete = False
+        self.ddl_bytes = 0
+
+    def transform(self, chunk: bytes) -> bytes:
+        at_start = self.line_start
+        self.line_start = chunk.endswith(b"\n")
+        if at_start and chunk.rstrip(b"\r\n") == b"CREATE TABLE `records` (":
+            if self.in_records or self.complete:
+                raise PipelineError("unexpected duplicate records table declaration")
+            self.in_records = True
+        if not self.in_records:
+            return chunk
+        self.ddl_bytes += len(chunk)
+        if self.ddl_bytes > 256 * 1024:
+            raise PipelineError("records table declaration exceeds the safe DDL limit")
+        if at_start and chunk.startswith(b")"):
+            if not re.fullmatch(rb"\) ENGINE=InnoDB[^\r\n]*;\r?\n", chunk):
+                raise PipelineError("unsupported records table declaration for compression")
+            if re.search(rb"\b(?:ROW_FORMAT|KEY_BLOCK_SIZE)\s*=", chunk, re.I):
+                raise PipelineError("records table already specifies storage options")
+            self.in_records = False
+            self.complete = True
+            return chunk.replace(
+                b") ENGINE=InnoDB",
+                b") ENGINE=InnoDB ROW_FORMAT=COMPRESSED KEY_BLOCK_SIZE=8",
+                1,
+            )
+        return chunk
+
+    def finish(self) -> None:
+        if not self.complete or self.in_records:
+            raise PipelineError("no complete records table declaration found for compression")
+
+
 class MySQLServer:
     def __init__(
         self,
         tools: MySQLTools,
         datadir: Path,
         buffer_pool_size: str,
+        compact_storage: bool = False,
+        progress_seconds: float | None = None,
     ) -> None:
         self.tools = tools
         self.datadir = datadir.resolve()
         self.buffer_pool_size = buffer_pool_size
+        self.compact_storage = compact_storage
         self.runtime = tempfile.TemporaryDirectory(prefix="ojs-api-mysql-")
         runtime_path = Path(self.runtime.name)
         self.socket = runtime_path / "mysql.sock"
@@ -374,14 +565,130 @@ class MySQLServer:
         self.server_log = runtime_path / "mysqld.log"
         self.disk_tmp = self.datadir.parent / f".{self.datadir.name}-mysql-tmp"
         self.running = False
+        self.progress_seconds = progress_interval(progress_seconds)
+        self._clients: set[subprocess.Popen] = set()
+        self._clients_lock = threading.Lock()
+        self._clients_cancelled = False
 
-    def _log_tail(self) -> str:
-        if not self.server_log.exists():
+    def process_pid(self) -> int | None:
+        try:
+            return int(self.pid_file.read_text(encoding="ascii").strip())
+        except (OSError, ValueError):
+            return None
+
+    def cancel_clients(self) -> None:
+        """Prevent queued workers from starting and stop all active mysql clients."""
+        with self._clients_lock:
+            self._clients_cancelled = True
+            clients = tuple(self._clients)
+        for process in clients:
+            stop_process(process)
+
+    def _run_mysql(
+        self,
+        feed: Callable[[BinaryIO, Progress], None],
+        *,
+        label: str,
+        database: str | None,
+        password: str | None,
+        capture_result: bool = False,
+        stream_progress: bool = True,
+        interval: float | None = None,
+        **fields: object,
+    ) -> str:
+        # Register under the cancellation lock so an interrupted worker pool
+        # cannot create a new client after cancel_clients() has taken its snapshot.
+        with self._clients_lock:
+            if self._clients_cancelled:
+                raise PipelineError("MySQL work was cancelled")
+            process = subprocess.Popen(
+                self._client_args(database), stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                env=self._password_env(password),
+            )
+            self._clients.add(process)
+        assert process.stdin is not None
+        assert process.stdout is not None
+        assert process.stderr is not None
+        result = bytearray()
+        errors: list[str] = []
+        reader_errors: list[BaseException] = []
+        readers: list[threading.Thread] = []
+        try:
+            with Progress(
+                label, interval=interval or self.progress_seconds,
+                process_pid=self.process_pid() or process.pid,
+                disk_path=self.datadir.parent, **fields,
+            ) as progress:
+                def read_stdout() -> None:
+                    try:
+                        if capture_result:
+                            while chunk := process.stdout.read(64 * 1024):
+                                if len(result) + len(chunk) > BUFFER_SIZE:
+                                    raise PipelineError("MySQL query result exceeds bounded capture limit")
+                                result.extend(chunk)
+                        else:
+                            for line in bounded_lines(process.stdout):
+                                if stream_progress:
+                                    consume_sql_progress(line, progress)
+                    except BaseException as exc:
+                        reader_errors.append(exc)
+                        stop_process(process)
+
+                def read_stderr() -> None:
+                    try:
+                        for line in bounded_lines(process.stderr):
+                            detail = safe_mysql_error(line)
+                            if detail is not None:
+                                errors[:] = [detail]
+                    except BaseException as exc:
+                        reader_errors.append(exc)
+                        stop_process(process)
+
+                for target in (read_stdout, read_stderr):
+                    reader = threading.Thread(target=target, name="ojs-mysql-output", daemon=True)
+                    reader.start()
+                    readers.append(reader)
+                try:
+                    try:
+                        feed(process.stdin, progress)
+                        process.stdin.close()
+                    except BrokenPipeError:
+                        pass
+                    return_code = process.wait()
+                    for reader in readers:
+                        reader.join()
+                    if reader_errors:
+                        raise reader_errors[0]
+                    if return_code != 0:
+                        detail = f": {errors[0]}" if errors else ""
+                        raise PipelineError(f"MySQL {label} failed with exit code {return_code}{detail}")
+                except BaseException:
+                    stop_process(process)
+                    raise
+        finally:
+            stop_process(process)
+            for stream in (process.stdin, process.stdout, process.stderr):
+                try:
+                    stream.close()
+                except (BrokenPipeError, OSError):
+                    pass
+            for reader in readers:
+                reader.join()
+            with self._clients_lock:
+                self._clients.discard(process)
+        return result.decode("utf-8", errors="replace").strip()
+
+    def _daemon_error_codes(self) -> str:
+        try:
+            with self.server_log.open("rb") as source:
+                source.seek(0, os.SEEK_END)
+                source.seek(max(0, source.tell() - 8192))
+                tail = source.read(8192)
+        except OSError:
             return ""
-        return self.server_log.read_text(
-            encoding="utf-8",
-            errors="replace",
-        )[-6000:]
+        codes = re.findall(rb"\[ERROR\] \[(MY-[0-9]{6})\]", tail)
+        return "/".join(code.decode("ascii") for code in codes[-4:])
 
     @staticmethod
     def _password_env(password: str | None) -> dict[str, str]:
@@ -400,6 +707,7 @@ class MySQLServer:
             f"--socket={self.socket}",
             "--user=root",
             "--batch",
+            "--unbuffered",
             "--skip-column-names",
             "--binary-mode=1",
             "--disable-named-commands",
@@ -409,9 +717,33 @@ class MySQLServer:
             args.append(database)
         return args
 
+    def _run_control(
+        self, args: list[str], *, label: str, password: str | None = None,
+        allow_failure: bool = False,
+    ):
+        code = None
+        try:
+            with Progress(label, interval=self.progress_seconds, disk_path=self.datadir.parent):
+                process = subprocess.Popen(
+                    args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    env=self._password_env(password),
+                )
+                try:
+                    code = process.wait()
+                    if code != 0:
+                        daemon_codes = self._daemon_error_codes()
+                        detail = f" daemon_errors={daemon_codes}" if daemon_codes else ""
+                        raise PipelineError(f"{label} failed with exit code {code}{detail}")
+                finally:
+                    stop_process(process)
+        except PipelineError:
+            if not allow_failure or code is None:
+                raise
+        return subprocess.CompletedProcess(args, code)
+
     def initialize(self) -> None:
         self.datadir.mkdir(parents=True)
-        result = subprocess.run(
+        result = self._run_control(
             [
                 self.tools.mysqld,
                 "--no-defaults",
@@ -419,24 +751,23 @@ class MySQLServer:
                 f"--datadir={self.datadir}",
                 f"--log-error={self.server_log}",
             ],
-            text=True,
-            capture_output=True,
+            label="mysql-initialize",
         )
         if result.returncode != 0:
             error = command_error("MySQL initialization", result)
-            raise PipelineError(f"{error}\n{self._log_tail()}") from error
+            raise error
 
     def start(self, password: str | None) -> None:
         self.disk_tmp.mkdir(parents=True, exist_ok=True)
         max_connections = os.environ.get(
             "OJS_BUILDER_MYSQL_MAX_CONNECTIONS",
-            "16",
+            "8",
         )
         temptable_max_ram = os.environ.get(
             "OJS_BUILDER_MYSQL_TEMPTABLE_MAX_RAM",
-            "256M",
+            "64M",
         )
-        result = subprocess.run(
+        result = self._run_control(
             [
                 self.tools.mysqld,
                 "--no-defaults",
@@ -449,9 +780,10 @@ class MySQLServer:
                 f"--innodb-buffer-pool-size={self.buffer_pool_size}",
                 f"--max-connections={max_connections}",
                 f"--temptable-max-ram={temptable_max_ram}",
-                "--tmp-table-size=64M",
-                "--max-heap-table-size=64M",
-                "--innodb-redo-log-capacity=4G",
+                "--tmp-table-size=16M",
+                "--max-heap-table-size=16M",
+                "--innodb-redo-log-capacity=256M",
+                "--innodb-file-per-table=ON",
                 "--skip-networking",
                 "--mysqlx=0",
                 "--skip-log-bin",
@@ -460,13 +792,12 @@ class MySQLServer:
                 "--character-set-server=utf8mb4",
                 "--collation-server=utf8mb4_0900_ai_ci",
             ],
-            text=True,
-            capture_output=True,
+            label="mysql-start",
         )
         if result.returncode != 0:
             shutil.rmtree(self.disk_tmp, ignore_errors=True)
             error = command_error("MySQL startup", result)
-            raise PipelineError(f"{error}\n{self._log_tail()}") from error
+            raise error
         self.running = True
 
         deadline = time.monotonic() + 30
@@ -497,17 +828,12 @@ class MySQLServer:
         *,
         database: str | None = None,
         password: str | None = None,
+        label: str = "statement",
     ) -> str:
-        result = subprocess.run(
-            self._client_args(database),
-            input=sql,
-            text=True,
-            capture_output=True,
-            env=self._password_env(password),
+        return self._run_mysql(
+            lambda target, progress: target.write(sql.encode("utf-8")),
+            label=label, database=database, password=password, capture_result=True,
         )
-        if result.returncode != 0:
-            raise command_error("MySQL statement", result)
-        return result.stdout.strip()
 
     def run_sql_file(
         self,
@@ -517,41 +843,14 @@ class MySQLServer:
         password: str | None,
         prelude: str = "",
     ) -> None:
-        stderr_path = Path(self.runtime.name) / "script.stderr"
-        with stderr_path.open("wb") as stderr:
-            process = subprocess.Popen(
-                self._client_args(database),
-                stdin=subprocess.PIPE,
-                stdout=subprocess.DEVNULL,
-                stderr=stderr,
-                env=self._password_env(password),
-            )
-            assert process.stdin is not None
-            try:
-                if prelude:
-                    process.stdin.write(prelude.encode("utf-8"))
-                    if not prelude.endswith("\n"):
-                        process.stdin.write(b"\n")
-                with path.open("rb") as source:
-                    while chunk := source.read(BUFFER_SIZE):
-                        process.stdin.write(chunk)
-            except BrokenPipeError:
-                pass
-            finally:
-                try:
-                    process.stdin.close()
-                except BrokenPipeError:
-                    pass
-            return_code = process.wait()
-        if return_code != 0:
-            stderr_text = stderr_path.read_text(
-                encoding="utf-8",
-                errors="replace",
-            )
-            raise PipelineError(
-                f"MySQL script {path.name} failed with exit code "
-                f"{return_code}: {stderr_text[-6000:]}"
-            )
+        def feed(target: BinaryIO, progress: Progress) -> None:
+            if prelude:
+                target.write((prelude.rstrip("\n") + "\n").encode("utf-8"))
+            with path.open("rb") as source:
+                while chunk := source.read(BUFFER_SIZE):
+                    target.write(chunk)
+
+        self._run_mysql(feed, label="sql-script", database=database, password=password)
 
     def run_sql_text(
         self,
@@ -561,23 +860,16 @@ class MySQLServer:
         database: str,
         password: str | None,
         prelude: str = "",
+        **progress_fields: object,
     ) -> None:
         statement = prelude
         if statement and not statement.endswith("\n"):
             statement += "\n"
         statement += sql
-        result = subprocess.run(
-            self._client_args(database),
-            input=statement,
-            text=True,
-            capture_output=True,
-            env=self._password_env(password),
+        self._run_mysql(
+            lambda target, progress: target.write(statement.encode("utf-8")),
+            label=label, database=database, password=password, **progress_fields,
         )
-        if result.returncode != 0:
-            raise PipelineError(
-                f"MySQL {label} failed with exit code {result.returncode}: "
-                f"{result.stderr[-6000:]}"
-            )
 
     def _stream_into_mysql(
         self,
@@ -589,61 +881,34 @@ class MySQLServer:
         password: str | None,
         progress_seconds: float,
         calculate_sha256: bool,
+        compact_records: bool = False,
     ) -> str | None:
         digest = hashlib.sha256() if calculate_sha256 else None
         processed = 0
-        last_report = time.monotonic()
-        stderr_path = Path(self.runtime.name) / "import.stderr"
-        with stderr_path.open("wb") as stderr:
-            process = subprocess.Popen(
-                self._client_args(database),
-                stdin=subprocess.PIPE,
-                stdout=subprocess.DEVNULL,
-                stderr=stderr,
-                env=self._password_env(password),
+        ddl = RawRecordsDDL() if compact_records else None
+        def feed(target: BinaryIO, progress: Progress) -> None:
+            nonlocal processed
+            read_chunk = (
+                (lambda: source.readline(64 * 1024))
+                if ddl is not None else (lambda: source.read(BUFFER_SIZE))
             )
-            assert process.stdin is not None
-            try:
-                while chunk := source.read(BUFFER_SIZE):
-                    if digest is not None:
-                        digest.update(chunk)
-                    process.stdin.write(chunk)
-                    processed += len(chunk)
-                    now = time.monotonic()
-                    if now - last_report >= progress_seconds:
-                        denominator = (
-                            f" / {format_bytes(total)}"
-                            if total > 0
-                            else ""
-                        )
-                        print(
-                            f"[transfer] {label}: "
-                            f"{format_bytes(processed)}{denominator}"
-                        )
-                        last_report = now
-            except BrokenPipeError:
-                pass
-            finally:
-                try:
-                    process.stdin.close()
-                except BrokenPipeError:
-                    pass
-            return_code = process.wait()
+            while chunk := read_chunk():
+                if digest is not None:
+                    digest.update(chunk)
+                target.write(ddl.transform(chunk) if ddl else chunk)
+                processed += len(chunk)
+                progress.update(processed_bytes=processed)
+            if ddl is not None:
+                ddl.finish()
+            if total > 0 and processed != total:
+                raise PipelineError(f"MySQL import consumed {processed} bytes; expected {total}")
+            progress.update(step="waiting-for-mysql")
 
-        if return_code != 0:
-            stderr_text = stderr_path.read_text(
-                encoding="utf-8",
-                errors="replace",
-            )
-            raise PipelineError(
-                f"MySQL import failed with exit code {return_code}: "
-                f"{stderr_text[-6000:]}"
-            )
-        if total > 0 and processed != total:
-            raise PipelineError(
-                f"MySQL import consumed {processed} bytes; expected {total}"
-            )
-        print(f"[transfer] {label}: {format_bytes(processed)}")
+        self._run_mysql(
+            feed, label="sql-import", database=database, password=password,
+            interval=progress_seconds, total_bytes=total or None,
+            processed_bytes=0, step="feeding-mysql", stream_progress=False,
+        )
         return digest.hexdigest() if digest is not None else None
 
     def import_snapshot(
@@ -654,7 +919,7 @@ class MySQLServer:
         password: str | None,
         progress_seconds: float,
     ) -> str:
-        with snapshot.path.open("rb") as source:
+        with open_snapshot(snapshot.path) as source:
             digest = self._stream_into_mysql(
                 source,
                 label=snapshot.path.name,
@@ -663,8 +928,13 @@ class MySQLServer:
                 password=password,
                 progress_seconds=progress_seconds,
                 calculate_sha256=True,
+                compact_records=self.compact_storage,
             )
         assert digest is not None
+        if snapshot.path.name.endswith(".gz"):
+            expected = validate_cached_snapshot(snapshot.path)["uncompressed_sha256"]
+            if digest != expected:
+                raise PipelineError("imported SQL hash differs from validated gzip metadata")
         return digest
 
     def import_clean_export(
@@ -675,7 +945,7 @@ class MySQLServer:
         password: str | None,
         progress_seconds: float,
     ) -> None:
-        verify_checksum_sidecar(clean_export.path)
+        verify_checksum_sidecar(clean_export.path, progress_seconds=progress_seconds)
         with gzip.open(clean_export.path, "rb") as source:
             self._stream_into_mysql(
                 source,
@@ -694,7 +964,6 @@ class MySQLServer:
         database: str,
         password: str | None,
     ) -> None:
-        stderr_path = Path(self.runtime.name) / "dump.stderr"
         args = [
             self.tools.mysqldump,
             "--no-defaults",
@@ -714,42 +983,48 @@ class MySQLServer:
             database,
             *CLEAN_EXPORT_TABLES,
         ]
-        with stderr_path.open("wb") as stderr:
+        with Progress(
+            "clean-export", interval=self.progress_seconds,
+            process_pid=self.process_pid(), disk_path=output_path.parent,
+            processed_bytes=0, compressed_bytes=0,
+        ) as progress:
             process = subprocess.Popen(
                 args,
                 stdout=subprocess.PIPE,
-                stderr=stderr,
+                stderr=subprocess.DEVNULL,
                 env=self._password_env(password),
             )
             assert process.stdout is not None
-            with output_path.open("wb") as raw_output:
-                with gzip.GzipFile(
-                    filename="",
-                    mode="wb",
-                    compresslevel=6,
-                    fileobj=raw_output,
-                    mtime=0,
-                ) as compressed:
-                    while chunk := process.stdout.read(BUFFER_SIZE):
-                        compressed.write(chunk)
-            return_code = process.wait()
-        if return_code != 0:
-            stderr_text = stderr_path.read_text(
-                encoding="utf-8",
-                errors="replace",
-            )
-            output_path.unlink(missing_ok=True)
-            raise PipelineError(
-                f"clean SQL export failed with exit code {return_code}: "
-                f"{stderr_text[-6000:]}"
-            )
+            processed = 0
+            try:
+                with output_path.open("wb") as raw_output:
+                    with gzip.GzipFile(
+                        filename="", mode="wb", compresslevel=6,
+                        fileobj=raw_output, mtime=0,
+                    ) as compressed:
+                        while chunk := process.stdout.read(BUFFER_SIZE):
+                            compressed.write(chunk)
+                            processed += len(chunk)
+                            progress.update(processed_bytes=processed, compressed_bytes=raw_output.tell())
+                    progress.update(compressed_bytes=raw_output.tell(), step="waiting-for-mysqldump")
+                return_code = process.wait()
+                if return_code != 0:
+                    raise PipelineError(f"clean SQL export failed with exit code {return_code}")
+            except BaseException:
+                stop_process(process)
+                output_path.unlink(missing_ok=True)
+                raise
+            finally:
+                stop_process(process)
+                process.stdout.close()
 
     def shutdown(self, password: str | None) -> None:
-        if not self.running:
+        self.cancel_clients()
+        if not self.running and not self.pid_file.exists():
             shutil.rmtree(self.disk_tmp, ignore_errors=True)
             self.runtime.cleanup()
             return
-        result = subprocess.run(
+        result = self._run_control(
             [
                 self.tools.mysqladmin,
                 "--no-defaults",
@@ -758,9 +1033,7 @@ class MySQLServer:
                 "--user=root",
                 "shutdown",
             ],
-            env=self._password_env(password),
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            label="mysql-shutdown", password=password, allow_failure=True,
         )
         if result.returncode != 0 and self.pid_file.exists():
             try:
@@ -768,6 +1041,18 @@ class MySQLServer:
                 os.kill(pid, signal.SIGTERM)
             except (OSError, ValueError):
                 pass
+        with Progress(
+            "mysql-shutdown-wait", interval=self.progress_seconds,
+            process_pid=self.process_pid(), disk_path=self.datadir.parent,
+        ):
+            deadline = time.monotonic() + 120
+            while self.pid_file.exists() and time.monotonic() < deadline:
+                time.sleep(0.25)
+            if self.pid_file.exists():
+                raise PipelineError(
+                    f"MySQL did not shut down cleanly; retaining {self.datadir} "
+                    "and refusing to publish or delete its working files"
+                )
         self.running = False
         shutil.rmtree(self.disk_tmp, ignore_errors=True)
         self.runtime.cleanup()
@@ -780,29 +1065,69 @@ def create_database(server: MySQLServer, database: str) -> None:
         f"CREATE DATABASE `{database}` "
         "CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;"
     )
-    server.execute("SET GLOBAL innodb_flush_log_at_trx_commit=2;")
+    # Checkpoints must never become durable ahead of the SQL they describe.
+    server.execute("SET GLOBAL innodb_flush_log_at_trx_commit=1;")
+
+
+def assert_database_stopped(datadir: Path) -> None:
+    """Refuse offline verification/deletion while a MySQL process owns the data."""
+    target = datadir.resolve()
+    for process in Path("/proc").glob("[0-9]*"):
+        try:
+            if (process / "comm").read_text().strip() != "mysqld":
+                continue
+            arguments = (process / "cmdline").read_bytes().decode().split("\0")
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        except PermissionError as exc:
+            raise PipelineError("cannot inspect MySQL processes before offline work") from exc
+        for index, argument in enumerate(arguments):
+            declared = None
+            if argument.startswith("--datadir="):
+                declared = argument.split("=", 1)[1]
+            elif argument == "--datadir" and index + 1 < len(arguments):
+                declared = arguments[index + 1]
+            if declared and Path(declared).resolve() == target:
+                raise PipelineError(f"MySQL is still using database directory: {target}")
+    # InnoDB's POSIX write lock also detects a container whose internal datadir
+    # path differs from the host path, without requiring a Docker installation.
+    tablespace = target / "ibdata1"
+    if tablespace.is_symlink():
+        raise PipelineError(f"refusing symlinked InnoDB system tablespace: {tablespace}")
+    if tablespace.exists():
+        with tablespace.open("r+b") as source:
+            try:
+                fcntl.lockf(source.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise PipelineError(f"InnoDB still has the database open: {target}") from exc
+            finally:
+                fcntl.lockf(source.fileno(), fcntl.LOCK_UN)
 
 
 def validate_database(
     server: MySQLServer,
     database: str,
     password: str | None,
+    *,
+    require_raw: bool = True,
 ) -> tuple[BuildCounts, str]:
-    raw_tables = server.execute(
-        """
-        SELECT COUNT(*)
-        FROM information_schema.tables
-        WHERE table_schema = DATABASE()
-          AND table_type = 'BASE TABLE'
-          AND table_name IN ('contexts', 'endpoints', 'issns', 'records', 'versions');
-        """,
-        database=database,
-        password=password,
-    )
-    if raw_tables != "5":
-        raise PipelineError(
-            f"database validation found {raw_tables or '0'} of 5 required raw tables"
+    if require_raw:
+        raw_tables = server.execute(
+            """
+            SELECT COUNT(*)
+            FROM information_schema.tables
+            WHERE table_schema = DATABASE()
+              AND table_type = 'BASE TABLE'
+              AND table_name IN ('contexts', 'endpoints', 'issns', 'records', 'versions');
+            """,
+            database=database,
+            password=password,
+            label="validate-raw-tables",
         )
+        if raw_tables != "5":
+            raise PipelineError(
+                f"database validation found {raw_tables or '0'} of 5 required raw tables"
+            )
 
     output = server.execute(
         """
@@ -860,6 +1185,7 @@ def validate_database(
         """,
         database=database,
         password=password,
+        label="validate-counts-and-identities",
     )
     lines = output.splitlines()
     if len(lines) != 3:
@@ -896,6 +1222,33 @@ def validate_database(
             f"{identity_conflicts} source-key assignments conflict"
         )
     return counts, lines[2]
+
+
+def prune_build_tables(
+    server: MySQLServer, *, database: str, password: str | None
+) -> None:
+    """Keep only temporal state and provenance in the publishable data directory."""
+    retained = set(CLEAN_EXPORT_TABLES) | {"ojs_pipeline_metadata"}
+    names = server.execute(
+        "SELECT table_name FROM information_schema.tables "
+        "WHERE table_schema = DATABASE() AND table_type = 'BASE TABLE';",
+        database=database,
+        password=password,
+    ).splitlines()
+    if not retained.issubset(names):
+        raise PipelineError("refusing raw cleanup before all clean tables exist")
+    discarded = sorted(set(names) - retained)
+    if any(not re.fullmatch(r"[A-Za-z0-9_]+", name) for name in discarded):
+        raise PipelineError("unexpected raw table identifier during cleanup")
+    if discarded:
+        server.execute(
+            "SET FOREIGN_KEY_CHECKS=0;\n"
+            + "\n".join(f"DROP TABLE `{name}`;" for name in discarded)
+            + "\nSET FOREIGN_KEY_CHECKS=1;",
+            database=database,
+            password=password,
+        )
+        print(f"[cleanup] dropped {len(discarded)} imported raw/work tables")
 
 
 def write_provenance(
@@ -986,6 +1339,7 @@ def collect_change_report(
         """,
         database=database,
         password=password,
+        label="change-report-prior-snapshot",
     )
     previous_counts: dict[str, object] | None = None
     if previous_output:
@@ -1087,6 +1441,7 @@ def collect_change_report(
         """,
         database=database,
         password=password,
+        label="change-report-source-counts",
     )
     fields = source_output.split("\t")
     if len(fields) != 14:
@@ -1127,6 +1482,7 @@ def collect_change_report(
         """,
         database=database,
         password=password,
+        label="change-report-event-counts",
     )
     for line in event_output.splitlines():
         parts = line.split("\t")
@@ -1405,15 +1761,21 @@ def verify_existing_database(
     progress_seconds: float,
     verify_source_checksum: bool,
 ) -> BuildCounts:
+    assert_database_stopped(datadir)
     expected_source_sha256 = None
     if verify_source_checksum:
         print(f"[verify] hashing {snapshot.path.name}")
-        expected_source_sha256 = sha256_file(snapshot.path, progress_seconds)
+        expected_source_sha256 = snapshot_sha256(snapshot, progress_seconds)
 
-    server = MySQLServer(MySQLTools.discover(), datadir, buffer_pool_size)
+    server = MySQLServer(
+        MySQLTools.discover(), datadir, buffer_pool_size,
+        progress_seconds=progress_seconds,
+    )
     try:
         server.start(root_password)
-        counts, _ = validate_database(server, database, root_password)
+        counts, _ = validate_database(
+            server, database, root_password, require_raw=False
+        )
         metadata = server.execute(
             """
             SELECT
@@ -1498,7 +1860,10 @@ def verify_existing_database(
         mismatches.append("source_sha256: stored checksum is invalid")
     if mismatches:
         raise PipelineError("provenance validation failed:\n" + "\n".join(mismatches))
-    verify_checksum_sidecar(clean_export_path(datadir.parent, snapshot.version))
+    verify_checksum_sidecar(
+        clean_export_path(datadir.parent, snapshot.version),
+        progress_seconds=progress_seconds,
+    )
     verify_change_report(
         change_report_path(datadir.parent, snapshot.version),
         snapshot=snapshot,
@@ -1595,7 +1960,7 @@ def write_checksum_sidecar(path: Path, checksum: str) -> None:
     os.replace(temporary, sidecar)
 
 
-def verify_checksum_sidecar(path: Path) -> None:
+def verify_checksum_sidecar(path: Path, *, progress_seconds: float | None = None) -> None:
     if not path.is_file():
         raise PipelineError(f"clean SQL export does not exist: {path}")
     sidecar = checksum_sidecar_path(path)
@@ -1604,7 +1969,7 @@ def verify_checksum_sidecar(path: Path) -> None:
     fields = sidecar.read_text(encoding="ascii").strip().split()
     if len(fields) < 1 or not re.fullmatch(r"[0-9a-f]{64}", fields[0]):
         raise PipelineError(f"invalid clean SQL checksum file: {sidecar}")
-    actual = sha256_small_file(path)
+    actual = sha256_small_file(path, progress_seconds)
     if fields[0] != actual:
         raise PipelineError(
             f"clean SQL checksum mismatch for {path.name}: "
@@ -1706,23 +2071,28 @@ def write_build_state(
 ) -> None:
     path = build_state_path(staging_dir)
     temporary = path.with_suffix(".tmp")
-    temporary.write_text(
-        json.dumps(
-            {
-                "pipeline_version": PIPELINE_VERSION,
-                "snapshot_version": snapshot.version,
-                "source_filename": snapshot.path.name,
-                "source_size_bytes": snapshot.size,
-                "source_sha256": source_sha256,
-                "build_sql_sha256": build_sql_sha256,
-                "phase": phase,
-            },
-            sort_keys=True,
-        )
-        + "\n",
-        encoding="utf-8",
-    )
+    payload = json.dumps(
+        {
+            "pipeline_version": PIPELINE_VERSION,
+            "snapshot_version": snapshot.version,
+            "source_filename": snapshot.path.name,
+            "source_size_bytes": snapshot.size,
+            "source_sha256": source_sha256,
+            "build_sql_sha256": build_sql_sha256,
+            "phase": phase,
+        },
+        sort_keys=True,
+    ) + "\n"
+    with temporary.open("w", encoding="utf-8") as destination:
+        destination.write(payload)
+        destination.flush()
+        os.fsync(destination.fileno())
     os.replace(temporary, path)
+    descriptor = os.open(staging_dir, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def read_build_state(staging_dir: Path) -> dict[str, object] | None:
@@ -1815,6 +2185,7 @@ def extract_metadata_in_parallel(
         """,
         database=database,
         password=password,
+        label="metadata-range-bounds",
     )
     try:
         minimum, maximum = (int(value) for value in bounds.split("\t"))
@@ -1834,7 +2205,6 @@ def extract_metadata_in_parallel(
         f"across {len(ranges)} indexed ranges"
     )
     completed = 0
-    last_report = time.monotonic()
 
     def run_shard(item: tuple[int, tuple[int, int]]) -> int:
         index, (start, end) = item
@@ -1846,33 +2216,34 @@ def extract_metadata_in_parallel(
         )
         server.run_sql_text(
             metadata_sql,
-            label=f"metadata shard {index + 1}/{len(ranges)}",
+            label="metadata-shard",
             database=database,
             password=password,
             prelude=prelude,
+            shard=index + 1, total_ranges=len(ranges),
+            range_min_id=start, range_max_id=end,
         )
         return index
 
     items = list(enumerate(ranges))
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = {executor.submit(run_shard, item) for item in items}
+        futures = set()
         try:
+            for item in items:
+                futures.add(executor.submit(run_shard, item))
             for future in concurrent.futures.as_completed(futures):
-                future.result()
+                index = future.result()
                 completed += 1
-                now = time.monotonic()
-                if (
-                    completed == len(ranges)
-                    or now - last_report >= progress_seconds
-                ):
-                    print(
-                        f"[transform] metadata ranges: "
-                        f"{completed}/{len(ranges)} complete"
-                    )
-                    last_report = now
-        except Exception:
+                start, end = ranges[index]
+                print(
+                    f"[transform] metadata ranges: {completed}/{len(ranges)} complete; "
+                    f"shard={index + 1} range_min_id={start} range_max_id={end}",
+                    flush=True,
+                )
+        except BaseException:
             for future in futures:
                 future.cancel()
+            server.cancel_clients()
             raise
 
 
@@ -1896,6 +2267,7 @@ def build_snapshot_database(
     publish_current: bool,
     metadata_workers: int,
     resume_building: bool,
+    compact_storage: bool = False,
 ) -> tuple[Path, BuildCounts | None]:
     tools = MySQLTools.discover()
     final_dir = clean_dir / f"mysql-{snapshot.version}"
@@ -1908,6 +2280,9 @@ def build_snapshot_database(
     temporary_manifest = clean_dir / f".{final_manifest.name}.tmp"
     build_sql_sha256 = sha256_small_file(build_sql)
 
+    for owned_dir in (final_dir, staging_dir):
+        if owned_dir.exists():
+            assert_database_stopped(owned_dir)
     if final_dir.exists():
         if not force_rebuild:
             print(f"[publish] database already built: {final_dir}")
@@ -1942,16 +2317,17 @@ def build_snapshot_database(
             return final_dir, counts
         if final_dir.is_symlink():
             raise PipelineError(f"refusing to replace symlinked database: {final_dir}")
-        current_database = clean_dir / "mysql-current"
-        if (
-            current_database.is_symlink()
-            and current_database.resolve() == final_dir.resolve()
-        ):
-            raise PipelineError(
-                "refusing to force-rebuild the current serving database "
-                f"directory: {final_dir}; build in another clean directory or "
-                "stop the serving MySQL container first"
-            )
+        for pointer_name in ("mysql-current", "mysql-live"):
+            current_database = clean_dir / pointer_name
+            if (
+                current_database.is_symlink()
+                and current_database.resolve() == final_dir.resolve()
+            ):
+                raise PipelineError(
+                    "refusing to force-rebuild the current serving database "
+                    f"directory: {final_dir} ({pointer_name}); build in another "
+                    "clean directory"
+                )
         # Invalidate the prior commit marker before replacing any same-date
         # artifact. A crash from this point is therefore retried, not skipped.
         final_manifest.unlink(missing_ok=True)
@@ -2008,12 +2384,15 @@ def build_snapshot_database(
     else:
         print("[history] first observed snapshot; no prior clean state")
 
-    server = MySQLServer(tools, staging_dir, buffer_pool_size)
+    server = MySQLServer(
+        tools, staging_dir, buffer_pool_size, compact_storage,
+        progress_seconds=progress_seconds,
+    )
     active_password: str | None = None
     success = False
     counts: BuildCounts | None = None
     try:
-        build_parts = split_build_sql(build_sql)
+        build_parts = split_build_sql(build_sql, compact_storage)
         prelude_factory: Callable[[], str] = lambda: build_sql_prelude(
             snapshot=snapshot,
             source_sha256=source_sha256,
@@ -2034,7 +2413,7 @@ def build_snapshot_database(
                 build_sql_sha256=build_sql_sha256,
             )
             print(f"[checksum] verifying raw {snapshot.path.name} for resume")
-            source_sha256 = sha256_file(snapshot.path, progress_seconds)
+            source_sha256 = snapshot_sha256(snapshot, progress_seconds)
             if checkpoint_sha256 and source_sha256 != checkpoint_sha256:
                 raise PipelineError(
                     "raw SQL checksum does not match the staging checkpoint"
@@ -2166,6 +2545,13 @@ def build_snapshot_database(
             )
         stage_change_report(final_report, report)
 
+        prune_build_tables(server, database=database, password=active_password)
+        cleaned_counts, _ = validate_database(
+            server, database, active_password, require_raw=False
+        )
+        if cleaned_counts != counts:
+            raise PipelineError("clean table counts changed during raw cleanup")
+
         print(f"[export] writing {final_export.name}")
         server.export_clean_tables(
             temporary_export,
@@ -2182,7 +2568,7 @@ def build_snapshot_database(
         set_root_password(server, active_password, root_password)
         active_password = root_password
         success = True
-    except Exception as exc:
+    except BaseException as exc:
         temporary_export.unlink(missing_ok=True)
         temporary_report.unlink(missing_ok=True)
         temporary_manifest.unlink(missing_ok=True)
@@ -2203,10 +2589,26 @@ def build_snapshot_database(
     build_state_path(staging_dir).unlink(missing_ok=True)
     (staging_dir / "PIPELINE_FAILED.txt").unlink(missing_ok=True)
     os.replace(staging_dir, final_dir)
+    marker = final_dir / "OJS_COMPACT_RELEASE.json"
+    marker.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "snapshot_date": snapshot.version,
+                "source_sha256": source_sha256,
+                "build_sql_sha256": build_sql_sha256,
+                "clean_only": True,
+                "pipeline_version": PIPELINE_VERSION,
+                "data_directory_name": final_dir.name,
+            },
+            sort_keys=True,
+        ) + "\n",
+        encoding="utf-8",
+    )
     os.replace(temporary_export, final_export)
     os.replace(temporary_report, final_report)
     final_report.chmod(0o444)
-    export_sha256 = sha256_small_file(final_export)
+    export_sha256 = sha256_file(final_export, progress_seconds)
     write_checksum_sidecar(final_export, export_sha256)
     report_sha256 = sha256_small_file(final_report)
     write_checksum_sidecar(final_report, report_sha256)
@@ -2244,7 +2646,7 @@ def acquire_snapshot(args: argparse.Namespace) -> Snapshot:
     if args.snapshot:
         return inspect_snapshot(args.snapshot)
 
-    latest = args.raw_dir / "pkpbeacon-latest.sql"
+    latest = args.raw_dir / "pkpbeacon-latest.sql.gz"
     if not args.skip_download:
         command = [
             sys.executable,
@@ -2258,6 +2660,8 @@ def acquire_snapshot(args: argparse.Namespace) -> Snapshot:
         result = subprocess.run(command)
         if result.returncode != 0:
             raise PipelineError("Beacon download stage failed")
+    if not latest.exists():
+        latest = args.raw_dir / "pkpbeacon-latest.sql"
     if not latest.exists():
         raise PipelineError(
             f"latest snapshot pointer does not exist: {latest}; "
@@ -2357,6 +2761,13 @@ def pipeline_lock(clean_dir: Path):
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
+def progress_argument(value: str) -> float:
+    try:
+        return progress_interval(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
+
+
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(
         description=(
@@ -2367,7 +2778,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument(
         "--snapshot",
         type=Path,
-        help="use an existing pkpbeacon-YYYY-MM-DD.sql instead of downloading",
+        help="use an existing pkpbeacon-YYYY-MM-DD.sql[.gz] instead of downloading",
     )
     result.add_argument("--raw-dir", type=Path, default=DEFAULT_RAW_DIR)
     result.add_argument("--clean-dir", type=Path, default=DEFAULT_CLEAN_DIR)
@@ -2381,17 +2792,17 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument(
         "--skip-download",
         action="store_true",
-        help="use data/raw/pkpbeacon-latest.sql without contacting PKP",
+        help="use the latest local SQL snapshot without contacting PKP",
     )
     result.add_argument(
         "--download-only",
         action="store_true",
-        help="stop after downloading, extracting, and validating raw SQL",
+        help="stop after downloading and validating compressed raw SQL",
     )
     result.add_argument(
         "--force-download",
         action="store_true",
-        help="redownload and atomically replace the current remote snapshot",
+        help="redownload and verify the remote snapshot; never overwrite immutable input",
     )
     result.add_argument(
         "--force-rebuild",
@@ -2425,7 +2836,13 @@ def parser() -> argparse.ArgumentParser:
     )
     result.add_argument(
         "--mysql-buffer-pool-size",
-        default=os.environ.get("OJS_MYSQL_BUFFER_POOL_SIZE", "2G"),
+        default=os.environ.get("OJS_MYSQL_BUFFER_POOL_SIZE", "768M"),
+    )
+    result.add_argument(
+        "--compact-storage",
+        action=argparse.BooleanOptionalAction,
+        default=os.environ.get("OJS_COMPACT_STORAGE", "0") == "1",
+        help="create large raw and clean tables with native InnoDB compression",
     )
     result.add_argument(
         "--metadata-workers",
@@ -2466,11 +2883,15 @@ def parser() -> argparse.ArgumentParser:
             "the quarantined change report"
         ),
     )
-    result.add_argument("--progress-seconds", type=float, default=30)
+    result.add_argument(
+        "--progress-seconds", type=progress_argument,
+        default=os.environ.get("OJS_PROGRESS_SECONDS", "30"),
+        help="heartbeat interval, 1–3600 seconds (default: OJS_PROGRESS_SECONDS or 30)",
+    )
     return result
 
 
-def main(argv: list[str] | None = None) -> int:
+def _main(argv: list[str] | None = None) -> int:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(line_buffering=True)
     if hasattr(sys.stderr, "reconfigure"):
@@ -2577,6 +2998,7 @@ def main(argv: list[str] | None = None) -> int:
                     publish_current=is_target,
                     metadata_workers=args.metadata_workers,
                     resume_building=args.resume_building,
+                    compact_storage=args.compact_storage,
                 )
                 if not is_target and not args.keep_intermediate_databases:
                     shutil.rmtree(latest_dir)
@@ -2598,10 +3020,18 @@ def main(argv: list[str] | None = None) -> int:
     except (OSError, PipelineError, subprocess.SubprocessError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
+    except PipelineInterrupted as exc:
+        print(f"error: pipeline interrupted by signal {exc.signum}", file=sys.stderr)
+        return 128 + exc.signum
     except KeyboardInterrupt:
         print("error: pipeline interrupted", file=sys.stderr)
         return 130
     return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    with interruptible_pipeline():
+        return _main(argv)
 
 
 if __name__ == "__main__":

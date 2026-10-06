@@ -1,6 +1,6 @@
 PYTHON ?= python3
 
-.PHONY: credentials lightsail-preflight update automatic-update publish-live download scrape scrape-check rebuild-history verify verify-deep test compose
+.PHONY: credentials lightsail-preflight update automatic-update check-source publish-live download scrape scrape-check rebuild-history verify verify-deep test compose
 
 credentials:
 	./scripts/generate_api_credentials.sh
@@ -9,13 +9,16 @@ lightsail-preflight:
 	./scripts/lightsail_preflight.sh
 
 update:
-	$(PYTHON) src/run_pipeline.py
+	./scripts/automatic_update.sh
 
 automatic-update:
 	./scripts/automatic_update.sh
 
 publish-live:
-	$(PYTHON) src/publish_live.py
+	./scripts/automatic_update.sh --publish-only
+
+check-source:
+	./scripts/automatic_update.sh --check
 
 download:
 	$(PYTHON) src/run_pipeline.py --download-only
@@ -39,4 +42,4 @@ test:
 	$(PYTHON) -m unittest discover -s tests -v
 
 compose:
-	docker compose up --build
+	./scripts/automatic_update.sh --publish-only

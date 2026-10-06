@@ -45,27 +45,22 @@ if command -v docker >/dev/null 2>&1 \
     fail "the deployment user cannot reach the Docker daemon"
 fi
 
-minimum_filesystem_gb="${OJS_MIN_DATA_FILESYSTEM_GB:-900}"
-minimum_free_gb="${OJS_MIN_FREE_GB:-300}"
-minimum_memory_mb="${OJS_MIN_AVAILABLE_MEMORY_MB:-2048}"
-if [[ ! "$minimum_filesystem_gb" =~ ^[0-9]+$ ]]; then
-    fail "OJS_MIN_DATA_FILESYSTEM_GB must be a non-negative integer"
-    minimum_filesystem_gb=900
-fi
+minimum_free_gb="${OJS_MIN_FREE_GB:-20}"
+minimum_memory_mb="${OJS_MIN_AVAILABLE_MEMORY_MB:-512}"
 if [[ ! "$minimum_free_gb" =~ ^[0-9]+$ ]]; then
     fail "OJS_MIN_FREE_GB must be a non-negative integer"
-    minimum_free_gb=300
+    minimum_free_gb=20
 fi
 if [[ ! "$minimum_memory_mb" =~ ^[0-9]+$ ]]; then
     fail "OJS_MIN_AVAILABLE_MEMORY_MB must be a non-negative integer"
-    minimum_memory_mb=2048
+    minimum_memory_mb=512
 fi
 
 total_memory_kb="$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)"
 available_memory_kb="$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)"
 swap_total_kb="$(awk '/^SwapTotal:/ {print $2}' /proc/meminfo)"
-if (( total_memory_kb < 14 * 1024 * 1024 )); then
-    fail "less than 14 GiB of physical RAM is visible to Linux"
+if (( total_memory_kb < 3 * 1024 * 1024 )); then
+    fail "less than 3 GiB of physical RAM is visible; select at least the 4 GB plan"
 fi
 if (( available_memory_kb < minimum_memory_mb * 1024 )); then
     fail "less than ${minimum_memory_mb} MiB of memory is currently available"
@@ -84,16 +79,13 @@ else
     read -r filesystem_kb available_kb < <(
         df -Pk "$data_root" | awk 'NR == 2 {print $2, $4}'
     )
-    if (( filesystem_kb < minimum_filesystem_gb * 1024 * 1024 )); then
-        fail "data filesystem is smaller than ${minimum_filesystem_gb} GiB"
-    fi
     if (( available_kb < minimum_free_gb * 1024 * 1024 )); then
         fail "data filesystem has less than ${minimum_free_gb} GiB free"
     fi
     root_source="$(findmnt -n -o SOURCE -T / 2>/dev/null || true)"
     data_source="$(findmnt -n -o SOURCE -T "$data_root" 2>/dev/null || true)"
     if [[ -n "$root_source" && "$root_source" == "$data_source" ]]; then
-        fail "data uses the root filesystem instead of a separate Lightsail disk"
+        printf 'NOTE: data uses the root filesystem; the first full build must establish that its peak fits.\n'
     fi
     printf 'Data filesystem: %s (%s GiB total, %s GiB free)\n' \
         "${data_source:-unknown}" \
@@ -122,6 +114,9 @@ check_private_file \
 check_private_file \
     "${OJS_DB_API_PASSWORD_FILE:-$project_root/.secrets/db-api-password}" \
     "API database password file"
+check_private_file \
+    "${OJS_BEACON_CREDENTIALS_FILE:-$project_root/.secrets/beacon.ini}" \
+    "Beacon credential file"
 
 if [[ -z "${MYSQL_ROOT_PASSWORD:-}" \
     || "${MYSQL_ROOT_PASSWORD,,}" == *replace* ]]; then
@@ -180,4 +175,4 @@ if (( failures > 0 )); then
     printf 'Preflight failed with %s problem(s).\n' "$failures" >&2
     exit 1
 fi
-printf 'Lightsail 16 GiB preflight passed.\n'
+printf 'Lightsail 4 GiB configuration preflight passed; full-data peak storage/RAM still require measurement.\n'

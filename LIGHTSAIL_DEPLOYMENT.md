@@ -1,87 +1,114 @@
-# Deploy on a 16 GB AWS Lightsail Instance
+# Deploy on a small AWS Lightsail instance
 
-This is the small-host production profile for this repository. It assumes one
-Ubuntu Lightsail instance runs the API, serving MySQL, and the monthly builder.
-It deliberately trades build speed for predictable memory use.
+Deployment target: 6 October 2026. The default is a **4 GB RAM** Linux host,
+one processing worker, compressed data, and bounded local retention. Processing
+may take several days. The API keeps serving the previous release during the
+build; a successful release causes a short MySQL/API restart.
 
-The important limitation is storage: the current Beacon SQL dump is roughly
-130 GB before MySQL indexes and staging copies. A 16 GB Lightsail instance's
-root disk alone is not enough. Use an attached SSD data disk and archive old
-raw snapshots and releases off-host.
+## 1. Choose the cost and capacity
 
-## 1. Choose the Lightsail resources
+Start with Ubuntu 24.04 LTS, x86-64, the general-purpose **4 GB / 2 vCPU /
+80 GB SSD / public IPv4** bundle at **USD 24/month**. For the current full
+catalogue, budget a **256 GB attached SSD** at **USD 25.60/month**, for a starting
+total of **USD 49.60/month** before tax, snapshots and transfer overages.
+That is about 73% below the previous USD 184 estimate.
 
-In the Lightsail console, create:
+These are AWS list prices checked on 5 October 2026:
+[AWS pricing](https://aws.amazon.com/lightsail/pricing/),
+[bundle specifications](https://docs.aws.amazon.com/lightsail/latest/userguide/amazon-lightsail-bundles.html).
 
-1. An **OS-only Ubuntu 24 LTS** instance in the Region nearest the API users.
-2. The **standard Xlarge Linux/public-IPv4 bundle**: 4 vCPU, 16 GB RAM,
-   320 GB root SSD, and 6 TB transfer. As of 17 August 2026 AWS lists it at
-   USD 84/month. The cheaper memory-optimized 16 GB bundle has only 2 vCPU and
-   a 160 GB root disk, so it is a poor fit for this disk-heavy batch job.
-3. A **static IPv4 address**, attached before configuring DNS and TLS.
-4. An attached SSD disk in the same Availability Zone:
+The 256 GB disk is an initial capacity estimate, **not a full-dataset benchmark**.
+Compression ratios, article count, indexes and temporary SQL tables determine
+the peak. The preflight no longer requires a 1 TB disk. It is possible to use
+only included storage if a measured complete build fits, but the 80 GB root disk
+has not been demonstrated sufficient for this catalogue. Do not buy a smaller
+disk based on the compressed download size alone.
 
-   - 1 TB is the operational minimum if old files are archived and pruned
-     promptly.
-   - 2 TB is the safer starting point if several monthly raw files remain
-     online.
+The general-purpose plan is burstable: its sustained baseline is 20% per vCPU.
+Slow processing after CPU credits fall is expected. An optional USD 42/month
+compute-optimized 4 GB bundle includes 160 GB SSD and two dedicated vCPUs; it
+may be a better total price if a measured build fits that disk.
+[CPU baseline](https://docs.aws.amazon.com/lightsail/latest/userguide/baseline-cpu-performance.html),
+[dedicated compute announcement](https://aws.amazon.com/about-aws/whats-new/2026/04/lightsail-compute-optimized-instances/).
+Stopping an instance does not stop billing; do not use stop/start as a saving.
 
-AWS currently lists attached SSD storage at USD 0.10/GB-month, so the practical
-minimum is about USD 184/month before snapshots and transfer overages: USD 84
-for the instance plus roughly USD 100 for a 1 TB disk. Treat these as planning
-figures and check the current
-[Lightsail billing FAQ](https://docs.aws.amazon.com/lightsail/latest/userguide/amazon-lightsail-frequently-asked-questions-faq-billing-and-account-management.html)
-in the deployment Region.
+Only these large artifacts remain after a successful update:
 
-AWS documents the current bundles at
-[Lightsail instance bundles](https://docs.aws.amazon.com/lightsail/latest/userguide/amazon-lightsail-bundles.html).
-Attached disks persist independently of the instance, are encrypted by
-default, and can be up to 16 TB; see
-[Lightsail block storage](https://docs.aws.amazon.com/lightsail/latest/userguide/amazon-lightsail-faq-block-storage.html).
+- One downloaded raw `.sql.gz`, retained unchanged for validation/retry.
+- One clean serving MySQL directory.
+- One compressed clean export, required to carry temporal state into the next build.
 
-This plan is burstable. Its published CPU baseline is 40% per vCPU, so a large
-initial build can slow after burst capacity is spent. That is expected; do not
-solve it by raising worker counts. See
-[Lightsail CPU baseline and burst capacity](https://docs.aws.amazon.com/lightsail/latest/userguide/baseline-cpu-performance.html).
+Small checksummed reports, release manifests and cleanup records remain for
+audit. During a build, the old live directory and one candidate coexist so a
+failure can leave the old release working. There is no expanded raw SQL file,
+third live-import database, or indefinite archive of monthly databases.
 
-## 2. Set the Lightsail firewalls
+## 2. Create the instance, network and data disk
 
-Configure both the IPv4 and IPv6 firewalls. They are independent.
+Publish the reviewed repository changes to your chosen deployment branch before
+cloning it below; uncommitted workstation edits are not transferred by Git.
+Never add `.env`, `.secrets`, or the local data archive to that commit.
 
-| Port | Source | Purpose |
-| --- | --- | --- |
-| TCP 22 | Your fixed admin CIDR only | SSH |
-| TCP 80 | Anywhere | ACME redirect/challenge |
-| TCP 443 | Anywhere | Public HTTPS API |
+In Lightsail, create the OS-only instance in your chosen Region. Attach a static
+IPv4 address and point your API hostname's DNS A record to it. Set firewall
+rules on both IPv4 and IPv6: TCP 22 from your admin IP only, TCP 80/443 publicly.
+Keep ports 8000 and 3306 closed. Disable IPv6 if you will not configure it.
+[Firewall instructions](https://docs.aws.amazon.com/lightsail/latest/userguide/understanding-firewall-and-port-mappings-in-amazon-lightsail.html).
 
-Do not open 3306 or 8000. MySQL is internal and Compose binds the API to host
-loopback only. If IPv6 is not needed, disable it instead of leaving a more
-permissive IPv6 firewall. AWS notes that the most permissive overlapping rule
-wins; see
-[Lightsail firewalls](https://docs.aws.amazon.com/lightsail/latest/userguide/understanding-firewall-and-port-mappings-in-amazon-lightsail.html).
-
-Point the API hostname's DNS `A` record at the attached static IPv4 address.
-The normal instance address changes after stop/start; the attached static
-address does not.
-
-## 3. Patch Ubuntu and install the host tools
-
-SSH as the default `ubuntu` user:
+SSH as `ubuntu`, then install the basic tools and create the service account:
 
 ```bash
 sudo apt update
-sudo DEBIAN_FRONTEND=noninteractive apt full-upgrade -y
-sudo apt install -y \
-  ca-certificates caddy curl git gnupg gzip make openssl python3 tmux util-linux
+sudo apt upgrade -y
+sudo apt install -y ca-certificates curl git gzip make openssl python3 tmux util-linux cron caddy
+sudo timedatectl set-timezone UTC
+sudo useradd --create-home --shell /bin/bash ojs
+sudo install -d -o ojs -g ojs /srv/ojs_api
+sudo -u ojs git clone YOUR_REPOSITORY_URL /srv/ojs_api
 ```
 
-Install Docker Engine and the Compose plugin from Docker's official Ubuntu
-repository:
+Attach the data SSD in the same Availability Zone. Identify the actual blank
+device using `lsblk`; the console's device name may appear as NVMe in Linux.
+
+```bash
+lsblk -o NAME,SIZE,FSTYPE,LABEL,UUID,MOUNTPOINTS
+```
+
+The following format command is **only for the new empty data disk**. Replace the
+placeholder with its exact device. Never run it on the OS disk or an existing
+filesystem.
+
+```bash
+sudo mkfs.ext4 -m 1 -L ojs-data /dev/REPLACE_WITH_BLANK_DATA_DISK
+sudo blkid /dev/REPLACE_WITH_BLANK_DATA_DISK
+sudo install -d -o ojs -g ojs /srv/ojs_api/data
+sudo editor /etc/fstab
+```
+
+Add the data filesystem by its UUID:
+
+```fstab
+UUID=REPLACE_WITH_UUID /srv/ojs_api/data ext4 defaults,nofail,noatime 0 2
+```
+
+```bash
+sudo mount -a
+sudo chown ojs:ojs /srv/ojs_api/data
+findmnt -T /srv/ojs_api/data
+df -h /srv/ojs_api/data
+```
+
+[AWS disk installation instructions](https://docs.aws.amazon.com/lightsail/latest/userguide/create-and-attach-additional-block-storage-disks-linux-unix.html).
+If capacity proves insufficient, snapshot the disk and restore to a larger disk.
+Only perform that expansion after measuring the required peak.
+
+## 3. Install Docker and MySQL 8.4
+
+Install Docker Engine and Compose using its official Ubuntu repository:
 
 ```bash
 sudo install -m 0755 -d /etc/apt/keyrings
-sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
-  -o /etc/apt/keyrings/docker.asc
+sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
 sudo chmod a+r /etc/apt/keyrings/docker.asc
 sudo tee /etc/apt/sources.list.d/docker.sources >/dev/null <<EOF
 Types: deb
@@ -92,176 +119,82 @@ Architectures: $(dpkg --print-architecture)
 Signed-By: /etc/apt/keyrings/docker.asc
 EOF
 sudo apt update
-sudo apt install -y \
-  docker-ce docker-ce-cli containerd.io docker-buildx-plugin \
-  docker-compose-plugin
+sudo apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+sudo usermod -aG docker ojs
 sudo systemctl enable --now docker
 ```
 
-These are the current upstream steps from
-[Install Docker Engine on Ubuntu](https://docs.docker.com/engine/install/ubuntu/).
+[Official Docker instructions](https://docs.docker.com/engine/install/ubuntu/).
+Docker group membership is root-equivalent; keep this account dedicated.
 
-Install MySQL Community Server and client **8.4 LTS** from the official
-[MySQL APT repository](https://dev.mysql.com/doc/refman/8.4/en/linux-installation-apt-repo.html).
-Download the current `mysql-apt-config` package, install it with `dpkg -i`,
-select the MySQL 8.4 LTS series, run `sudo apt update`, and install
-`mysql-server`. Do not mix Ubuntu's native MySQL packages with Oracle's APT
-packages.
-The pipeline uses the host `mysqld`, `mysql`, `mysqladmin`, and `mysqldump`
-binaries, but starts its own isolated server. Disable the distribution service
-after installing the binaries so it does not consume RAM:
+Install host MySQL Community **8.4 LTS** using the
+[official MySQL APT instructions](https://dev.mysql.com/doc/refman/8.4/en/linux-installation-apt-repo.html):
+download the current `mysql-apt-config` package, install with `sudo dpkg -i`,
+select the 8.4 LTS series, then `sudo apt update && sudo apt install mysql-server`.
+The builder uses `mysqld`, `mysql`, `mysqladmin` and `mysqldump`. Disable the
+distribution's idle server and record the exact patch:
 
 ```bash
-mysqld --version
-mysql --version
 sudo systemctl disable --now mysql
+mysqld --version
+sudo apt-mark hold mysql-community-server mysql-community-server-core mysql-community-client mysql-community-client-core mysql-community-client-plugins
 ```
 
-Record the exact patch version. Later, set `OJS_MYSQL_IMAGE` to the matching
-official image tag. Do not let a different MySQL patch release mutate the same
-data directory. Hold the installed MySQL packages against unattended upgrades
-and upgrade the host binaries plus `OJS_MYSQL_IMAGE` together during a tested
-maintenance window.
+Set the matching exact patch in `OJS_MYSQL_IMAGE` later. Host and container open
+the same physical database, so upgrade both together in a tested maintenance
+window. Do not leave packages held forever without planned security updates.
+Never upgrade MySQL while a build or release switch is running.
 
-Record and hold the installed community packages (adjust the list only if the
-APT repository reports different installed package names):
-
-```bash
-dpkg-query -W -f='${binary:Package} ${Version}\n' \
-  mysql-community-server mysql-community-client
-sudo apt-mark hold \
-  mysql-community-server mysql-community-server-core \
-  mysql-community-client mysql-community-client-core \
-  mysql-community-client-plugins
-```
-
-Create the deployment account and checkout:
-
-```bash
-sudo useradd --create-home --shell /bin/bash ojs
-sudo usermod -aG docker ojs
-sudo install -d -o ojs -g ojs /srv/ojs_api
-sudo -u ojs git clone YOUR_REPOSITORY_URL /srv/ojs_api
-```
-
-Docker-group membership is root-equivalent. Do not use this account for email,
-browsing, or unrelated applications.
-
-## 4. Format and mount the attached data disk
-
-First identify the new, empty device:
-
-```bash
-lsblk -o NAME,SIZE,FSTYPE,LABEL,UUID,MOUNTPOINTS
-```
-
-The Lightsail console shows the device it attached, but Linux may expose an
-NVMe name. In the commands below, replace `/dev/REPLACE_WITH_NEW_DISK` with the
-exact blank device from `lsblk`.
-
-**Stop if `FSTYPE`, files, partitions, or a mount point already exist.** The
-next command destroys everything on the selected device and is only for a new
-blank disk.
-
-```bash
-sudo mkfs.ext4 -L ojs-data /dev/REPLACE_WITH_NEW_DISK
-sudo blkid /dev/REPLACE_WITH_NEW_DISK
-sudo install -d -o ojs -g ojs /srv/ojs_api/data
-```
-
-Add one line to `/etc/fstab`, using the UUID printed by `blkid`:
-
-```fstab
-UUID=REPLACE_WITH_UUID /srv/ojs_api/data ext4 defaults,nofail,noatime 0 2
-```
-
-Mount and verify it before downloading any data:
-
-```bash
-sudo mount -a
-sudo chown ojs:ojs /srv/ojs_api/data
-findmnt -T /srv/ojs_api/data
-df -h /srv/ojs_api/data
-```
-
-On this dedicated host, make Docker require the data mount before it can honor
-container restart policies:
-
-```bash
-sudo systemctl edit docker.service
-```
-
-Enter:
-
-```ini
-[Unit]
-RequiresMountsFor=/srv/ojs_api/data
-```
-
-Then apply it:
-
-```bash
-sudo systemctl daemon-reload
-sudo systemctl restart docker
-systemctl cat docker.service
-```
-
-Without this dependency, a failed `nofail` mount could let Docker start MySQL
-against an empty directory on the root disk. The update service has the same
-mount dependency checked in.
-
-Mounting the disk directly at the repository's `data/` path means the pipeline,
-Docker bind mount, disk-space guard, and systemd sandbox all refer to the same
-filesystem. AWS's Linux disk procedure is documented at
-[create and attach a disk](https://docs.aws.amazon.com/lightsail/latest/userguide/create-and-attach-additional-block-storage-disks-linux-unix.html).
-
-If the MySQL package installed an AppArmor profile, merge the checked-in rules
-from `deploy/apparmor-mysqld-ojs` into
-`/etc/apparmor.d/local/usr.sbin.mysqld`, preserving any existing local rules,
-then reload the profile:
+If the package enables AppArmor, merge `deploy/apparmor-mysqld-ojs` into
+`/etc/apparmor.d/local/usr.sbin.mysqld` and reload the actual installed profile:
 
 ```bash
 sudo editor /etc/apparmor.d/local/usr.sbin.mysqld
 sudo apparmor_parser -r /etc/apparmor.d/usr.sbin.mysqld
 ```
 
-Do not disable AppArmor globally. The narrow rules allow the builder to use the
-attached data tree and its private socket/log directory. If the profile or its
-`local/` include does not exist, confirm the installed MySQL package's policy
-layout before creating files.
+If there is no such profile/local include, check the installed package layout;
+do not disable AppArmor globally.
 
-## 5. Add emergency swap
+Make Docker wait for the data mount. Run `sudo systemctl edit docker.service`
+and enter:
 
-Swap is an OOM safety net, not working memory. Create 8 GB on the root disk:
+```ini
+[Unit]
+RequiresMountsFor=/srv/ojs_api/data
+```
+
+Then run `sudo systemctl daemon-reload && sudo systemctl restart docker`.
+
+## 4. Add emergency swap and set the memory budget
+
+Check `swapon --show` first. If no swap file already exists, create 4 GB on the
+root disk:
 
 ```bash
-sudo dd if=/dev/zero of=/swapfile bs=1M count=8192 status=progress
+sudo dd if=/dev/zero of=/swapfile bs=1M count=4096 status=progress
 sudo chmod 600 /swapfile
 sudo mkswap /swapfile
 sudo swapon /swapfile
+sudo editor /etc/fstab
 ```
 
-Add this line to `/etc/fstab`:
-
-```fstab
-/swapfile none swap sw 0 0
-```
-
-Keep normal workloads out of swap:
+Add `/swapfile none swap sw 0 0` to fstab, once. Set swappiness:
 
 ```bash
-printf 'vm.swappiness=10\n' | sudo tee /etc/sysctl.d/90-ojs-small-host.conf
+printf 'vm.swappiness=10\n' | sudo tee /etc/sysctl.d/90-ojs.conf
 sudo sysctl --system
 free -h
-swapon --show
 ```
 
-If swap use grows continuously during a build, stop and lower memory settings.
-Do not accept sustained SSD swapping as normal operation.
+The checked-in limits are 2 GiB for the entire builder service, 1 GiB for serving
+MySQL, and 256 MiB for the API, leaving roughly 768 MiB for Ubuntu/Docker. Builder
+and serving buffer pools are 768 MiB and 512 MiB. One metadata worker, disk-backed
+temporary tables and native InnoDB compression trade CPU time for memory/storage.
+Swap is a reserve: sustained swapping means the build needs a smaller working
+set or a larger host, not more workers.
 
-## 6. Configure credentials and the 16 GB profile
-
-Create the API and SELECT-only database credentials:
+## 5. Configure the private environment and credentials
 
 ```bash
 cd /srv/ojs_api
@@ -269,177 +202,151 @@ sudo -u ojs ./scripts/generate_api_credentials.sh
 sudo -u ojs cp .env.example .env
 sudo -u ojs chmod 600 .env
 openssl rand -hex 32
+id -u ojs
+id -g ojs
+sudo -u ojs editor .env
 ```
 
-Use that final random value for `MYSQL_ROOT_PASSWORD`; it is separate from the
-two secrets created by the script.
+Set `MYSQL_ROOT_PASSWORD` to the random value, `OJS_HOST_UID/GID` to the account
+numbers, `OJS_MYSQL_IMAGE` to the exact host patch, `OJS_ADMIN_EMAIL` to your
+address, and `OJS_PUBLIC_BASE_URL` to the public HTTPS origin. Leave the small-host
+resource values at their defaults for the first build.
 
-Create the PKP credential file outside the checkout:
+`OJS_PROGRESS_SECONDS=30` emits periodic progress while lengthy steps run.
+It accepts finite seconds from 1 through 3600. Start/completion events and SQL
+stage changes are also logged, so the daily job remains observable while a
+single statement takes hours.
 
-```bash
-sudo -u ojs install -d -m 700 /home/ojs/.config/ojs-api
-sudo -u ojs install -m 600 /dev/null \
-  /home/ojs/.config/ojs-api/beacon.ini
-sudo -u ojs editor /home/ojs/.config/ojs-api/beacon.ini
+The source URL is already set to:
+
+```text
+https://beacon.publicknowledgeproject.org/mysql/pkpbeacon.gz
 ```
 
-Its contents are:
+The source credential lives in `.secrets/beacon.ini`, mode 600, excluded from Git
+and Docker builds. The provided credential has been installed in that private
+file in the development checkout. Transfer it over SSH into the equivalent
+private path on the server; it will not arrive through `git clone`. Alternatively
+create it with `sudo -u ojs editor /srv/ojs_api/.secrets/beacon.ini`:
 
 ```ini
 [beacon]
 username = beacon-research
-password = REPLACE_WITH_THE_PKP_PASSWORD
+password = ENTER_THE_CURRENT_BEACON_PASSWORD_HERE
 ```
-
-Edit `/srv/ojs_api/.env`. Replace every placeholder and confirm these small-host
-values remain in place:
-
-```dotenv
-MYSQL_ROOT_PASSWORD=REPLACE_WITH_A_LONG_RANDOM_VALUE
-OJS_ADMIN_EMAIL=admin@your-domain.example
-OJS_PUBLIC_BASE_URL=https://api.your-domain.example
-OJS_MYSQL_IMAGE=mysql:REPLACE_WITH_EXACT_HOST_8.4_PATCH
-OJS_HOST_UID=REPLACE_WITH_ID_U_OJS
-OJS_HOST_GID=REPLACE_WITH_ID_G_OJS
-
-OJS_OAI_PAGE_SIZE=100
-OJS_METADATA_WORKERS=1
-OJS_MYSQL_BUFFER_POOL_SIZE=2G
-OJS_BUILDER_MYSQL_MAX_CONNECTIONS=16
-OJS_BUILDER_MYSQL_TEMPTABLE_MAX_RAM=256M
-OJS_SERVING_MYSQL_BUFFER_POOL_SIZE=5G
-OJS_SERVING_MYSQL_MAX_CONNECTIONS=50
-OJS_SERVING_MYSQL_TEMPTABLE_MAX_RAM=256M
-OJS_SERVING_MYSQL_MEMORY_LIMIT=7g
-OJS_SERVING_MYSQL_MEMORY_RESERVATION=5g
-OJS_SERVING_MYSQL_MEMSWAP_LIMIT=9g
-OJS_API_MEMORY_LIMIT=512m
-OJS_API_MEMSWAP_LIMIT=768m
-OJS_MIN_DATA_FILESYSTEM_GB=900
-OJS_MIN_FREE_GB=300
-OJS_MIN_AVAILABLE_MEMORY_MB=2048
-OJS_UPDATE_WORKING_SET_PERCENT=125
-OJS_UPDATE_HEADROOM_GB=20
-OJS_UPDATE_NICE=15
-OJS_KEEP_PREVIOUS_RELEASE=0
-```
-
-Obtain the numeric account values with:
 
 ```bash
-id -u ojs
-id -g ojs
+sudo -u ojs chmod 600 /srv/ojs_api/.secrets/beacon.ini
+sudo -u ojs -H /bin/bash -lc 'cd /srv/ojs_api && make lightsail-preflight'
+sudo -u ojs -H /bin/bash -lc 'cd /srv/ojs_api && make check-source'
 ```
 
-If using the HTML scraper, replace—not merely uncomment—the placeholder source
-URL. Never enable a cron job that still points to `example.com`.
+**Credential verification on 5 October 2026 returned HTTP 401 for HEAD and
+a one-byte GET.** Correct the private password before deployment; the check
+must authenticate successfully. No full remote dump was downloaded in that
+verification. Passwords never belong in cron entries, command arguments or Git.
 
-## 7. Run the small-host preflight
+## 6. Build the API image and install the bounded service
 
-Start a new login session so the `ojs` account receives Docker-group
-membership, then run:
-
-```bash
-sudo -u ojs -H /bin/bash -lc \
-  'cd /srv/ojs_api && ./scripts/lightsail_preflight.sh'
-```
-
-The preflight fails if required tools or secrets are missing, less than 14 GB
-RAM is visible, less than 4 GB swap exists, current available memory is below
-the configured floor, the data filesystem is smaller than 900 GiB, `data/` is
-still on the root filesystem, the disk lacks the configured free space,
-Compose is invalid, or placeholders remain.
-
-Do not lower `OJS_MIN_FREE_GB` merely to force a build onto a nearly full disk.
-Increase the attached disk by snapshotting it and creating a larger disk, which
-is the Lightsail-supported resize path.
-
-## 8. Build the first release
-
-Do the first build before starting Compose so serving MySQL is not competing
-for memory. Use a persistent `tmux` session:
-
-```bash
-sudo -u ojs -H tmux new -s ojs-build
-```
-
-Inside that `tmux` session, run:
+The service sends both output streams to the journal. Install the accompanying
+policy to keep logs across reboots with bounded storage. **This policy applies
+to the whole host's default journal, including other services.** Review any
+existing local logging policy before installing it; later drop-ins can override
+these settings.
 
 ```bash
 cd /srv/ojs_api
-set -a
-. ./.env
-set +a
-make update
-make verify
+sudo -u ojs docker compose build --pull ojs-api
+sudo install -o root -g root -m 644 deploy/ojs-api-update.service /etc/systemd/system/ojs-api-update.service
+sudo systemd-analyze cat-config systemd/journald.conf
+sudo install -d -o root -g root -m 755 /etc/systemd/journald.conf.d
+sudo install -o root -g root -m 644 deploy/journald-ojs-api.conf /etc/systemd/journald.conf.d/60-ojs-api.conf
+sudo systemctl restart systemd-journald
+sudo journalctl --flush
+sudo systemd-analyze cat-config systemd/journald.conf
+sudo journalctl --disk-usage
+sudo systemctl daemon-reload
+sudo systemctl start --no-block ojs-api-update.service
+sudo journalctl -u ojs-api-update.service -f -o short-iso
 ```
 
-If `OJS_SOURCE_INDEX_URL` is configured for an HTML archive instead, use this
-block in place of the preceding build block:
+The policy sets `Storage=persistent`, `SystemMaxUse=128M`,
+`RuntimeMaxUse=32M`, `SystemKeepFree=1G`, `MaxRetentionSec=14day` and daily
+file rotation. It prunes archived journal files; active files can make reported
+usage exceed the nominal budget. Size pressure can shorten the retained history.
+The free-space setting limits journal growth; it cannot reserve disk against
+other applications. These settings leave checksummed audit reports untouched.
+See the [upstream journal configuration documentation](https://github.com/systemd/systemd/blob/main/man/journald.conf.xml).
+
+`journalctl --flush` moves runtime logs to persistent storage after the
+configuration is activated. Use `restart systemd-journald` as shown, rather
+than separate stop/start commands, to preserve logging stream connections.
+[Upstream flush documentation](https://github.com/systemd/systemd/blob/main/man/journalctl.xml),
+[journal service restart documentation](https://github.com/systemd/systemd/blob/main/man/systemd-journald.service.xml).
+Check `journalctl --list-boots` after a future reboot to confirm history is
+available. The commands above are server installation steps, not actions taken
+automatically by the pipeline.
+
+The Python image is pinned to the current 3.12 patch listed by the
+[official image maintainers](https://hub.docker.com/_/python). Review image and
+dependency security updates regularly and rebuild/test deliberately; the daily
+data job does not upgrade application images. Host/container MySQL patch
+mismatches are rejected before database verification or service restart.
+
+The service does the first authenticated download, validation, build and
+publication. It stays independent of your SSH session. The first build can take
+days; the daily scheduler will not start another copy while it is running.
+The API is available only after the first complete release.
+
+The build streams gzip directly into MySQL without writing expanded SQL.
+Changed records are parsed and deduplicated; all source XML is hashed so an
+upstream edit is detected even if its timestamp did not change. Raw imported
+tables and obsolete staging tables are dropped before the final database is
+served. Reports and anomaly gates still run before publication.
+
+On later updates, the old API runs throughout processing. Publication briefly
+stops the containers, switches the live database, and checks the new authenticated
+API. Failed checks restore the previous release. Clients should retry transient
+connection errors/503s around publication. Logs record which old files were
+removed after successful checks.
+
+Monitor a complete first build:
 
 ```bash
-python3 src/scrape_updates.py --index-url "$OJS_SOURCE_INDEX_URL"
-python3 src/run_pipeline.py --skip-download
-make verify
-```
-
-Detach with `Ctrl-b d`; reattach with:
-
-```bash
-sudo -u ojs -H tmux attach -t ojs-build
-```
-
-On this burstable four-vCPU host, the build can take many hours. Keep
-`OJS_METADATA_WORKERS=1`. Monitor in another SSH session:
-
-```bash
+sudo systemctl status ojs-api-update.service
+sudo journalctl -u ojs-api-update.service -n 50 --no-pager -o short-iso
+sudo journalctl -u ojs-api-update.service --since yesterday --no-pager -o short-iso
 free -h
-vmstat 5
 df -h /srv/ojs_api/data
-ps -o pid,ni,%cpu,%mem,rss,cmd -C mysqld -C python3
+sudo -u ojs docker stats --no-stream
+systemctl show ojs-api-update.service -p MainPID -p CPUUsageNSec -p IOReadBytes -p IOWriteBytes -p MemoryCurrent -p MemoryPeak -p Result -p ExecMainStatus
 ```
 
-For a first Lightsail deployment, process the latest available snapshot with
-`make update`. Do not replay years of history on this host unless the attached
-disk, CPU time, and archive policy were sized for it. A full historical build
-can instead be produced on a temporary larger machine and transferred as a
-validated clean export plus report, checksums, and manifest.
+Docker statistics cover serving MySQL/API containers; the host builder is
+accounted for by `ojs-api-update.service`. Compare its CPU/I/O counters over time.
+Look for `[progress]` JSON lines: they identify the stage/SQL step, elapsed and
+idle seconds, and available byte, metadata-range or deduplication-pass counters.
+An unchanged step with heartbeats can still be one long database statement.
+A heartbeat alone proves only that the reporting process is alive; increasing
+counters or CPU/I/O supply additional evidence. No global percentage or exact
+ETA is implied. [Progress field guide](PROCESSING_GUIDE.md#reading-build-progress).
 
-## 9. Start MySQL and the API
+The disk reserve monitor stops work if free space falls below 8 GiB. The
+20 GiB starting floor is a guard, not a prediction that 20 GiB is enough.
+Use the measured peak to decide capacity; do not disable the reserve to force
+a build. A memory-limit failure is reported and the old release remains live.
 
-```bash
-cd /srv/ojs_api
-sudo -u ojs docker compose config --quiet
-sudo -u ojs docker compose up -d --build
-sudo -u ojs docker compose ps
-```
-
-The Compose profile caps serving MySQL at 7 GB plus 2 GB permitted swap and
-caps the API at 512 MB. MySQL's buffer pool is 5 GB. The monthly host builder
-uses a separate 2 GB buffer pool and one metadata worker.
-
-Smoke-test locally:
+## 7. Smoke-test the API and configure HTTPS
 
 ```bash
 curl --fail http://127.0.0.1:8000/health
 sudo -u ojs -H /bin/bash -lc '
-  set -a
   . /srv/ojs_api/.secrets/api-client.env
-  set +a
-  curl --fail --user "$OJS_API_USERNAME:$OJS_API_KEY" \
-    http://127.0.0.1:8000/meta
-  curl --fail --user "$OJS_API_USERNAME:$OJS_API_KEY" \
-    "http://127.0.0.1:8000/oai?verb=Identify"
+  curl --fail --user "$OJS_API_USERNAME:$OJS_API_KEY" http://127.0.0.1:8000/meta
 '
 ```
 
-## 10. Configure HTTPS
-
-AWS-managed Lightsail certificates do not attach directly to a plain VM; they
-attach to services such as a Lightsail load balancer or CDN. This single-VM
-profile uses Caddy and Let's Encrypt.
-
-Create `/etc/caddy/Caddyfile`:
+Edit `/etc/caddy/Caddyfile`, substituting the same hostname as `.env`:
 
 ```caddyfile
 api.your-domain.example {
@@ -448,8 +355,6 @@ api.your-domain.example {
 }
 ```
 
-Then validate and reload:
-
 ```bash
 sudo caddy validate --config /etc/caddy/Caddyfile
 sudo systemctl enable --now caddy
@@ -457,134 +362,64 @@ sudo systemctl reload caddy
 curl --fail https://api.your-domain.example/health
 ```
 
-Do not proceed until HTTPS works and unauthenticated data endpoints return
-`401`. The AWS certificate limitation is described in
-[TLS certificates in Lightsail](https://docs.aws.amazon.com/lightsail/latest/userguide/understanding-tls-ssl-certificates-in-lightsail-https.html).
+Check that an unauthenticated request to `/meta` returns 401. All data endpoints
+require the API user/key. The app has a bounded concurrency/page size, not a
+per-client rate limiter; use a proxy/WAF if shared clients require one.
 
-## 11. Enable the daily update timer
+## 8. Install the daily cron
 
-Use systemd, not cron, on Ubuntu:
+The repository provides a root-owned system cron file that starts the memory-
+limited, non-root service at **03:17 UTC every day**:
 
 ```bash
 cd /srv/ojs_api
-sudo install -m 644 deploy/ojs-api-update.service \
-  /etc/systemd/system/ojs-api-update.service
-sudo install -m 644 deploy/ojs-api-update.timer \
-  /etc/systemd/system/ojs-api-update.timer
-sudo systemctl daemon-reload
-sudo systemctl enable --now ojs-api-update.timer
-sudo systemctl start ojs-api-update.service
-sudo journalctl -u ojs-api-update.service -f
-```
-
-The job runs daily, but the expensive build runs only when a new dated file is
-pending. It is low-priority, requires at least 300 GB free on the **data**
-filesystem and 2 GB currently available RAM, and is constrained by systemd to
-6 GB memory plus 2 GB swap. Once a prior release exists, the wrapper raises the
-disk requirement dynamically to cover the last raw file plus current build
-database, 25% growth margin, and 20 GB scratch headroom. A failed build leaves
-the serving release intact.
-
-If systemd cannot be used, install the checked-in once-daily cron entry for the
-`ojs` account. Do not enable both schedulers:
-
-```bash
-sudo apt install -y cron
+sudo systemctl disable --now ojs-api-update.timer 2>/dev/null || true
+sudo install -o root -g root -m 644 deploy/ojs-api.cron /etc/cron.d/ojs-api
 sudo systemctl enable --now cron
-sudo -u ojs crontab /srv/ojs_api/deploy/ojs-api.crontab.example
-sudo -u ojs crontab -l
+sudo cat /etc/cron.d/ojs-api
 ```
 
-## 12. Configure snapshots and monitoring
+Do not install the optional systemd timer as well. If using `sudo crontab -e`
+instead, copy the entry in `deploy/ojs-api.crontab.example`; do not replace an
+existing root crontab wholesale.
 
-Enable Lightsail automatic instance snapshots well away from the 03:20–05:20
-randomized update start—for example 18:00 UTC. A new-data build can take longer
-than that, so monitor the monthly run and expect occasional overlap rather than
-claiming any clock time guarantees separation. Instance snapshots include
-attached disks. Automatic snapshots are daily and AWS retains the latest seven;
-they are also deleted if the source resource is deleted. Keep periodic manual
-snapshots and copy a monthly recovery point to another Region.
+An unchanged HEAD validator produces a cheap no-op. A changed remote response
+downloads one gzip, checks its CRC/footer/hash, and starts processing. The footer
+date is authoritative; the HTTP Last-Modified date need not equal it. Same-date
+content changes are rejected for review instead of silently overwriting history.
+If an update is still building, the daily start leaves that single run alone;
+the next check happens after it finishes.
 
-See:
+## 9. Retention, recovery and operating cost
 
-- [automatic snapshot configuration](https://docs.aws.amazon.com/lightsail/latest/userguide/amazon-lightsail-configuring-automatic-snapshots.html)
-- [Lightsail snapshot behavior](https://docs.aws.amazon.com/lightsail/latest/userguide/amazon-lightsail-faq-snapshots.html)
-- [copy snapshots between Regions](https://docs.aws.amazon.com/lightsail/latest/userguide/amazon-lightsail-copying-snapshots-from-one-region-to-another.html)
+After verified publication, automatic cleanup removes older **managed** raw
+gzips, clean exports and unmounted completed build directories. It retains the
+newest input, current database, current clean export, and small audit files.
+Symlinks, mounted databases, incomplete builds and unrecognized legacy inputs
+are not blindly deleted. Existing user-supplied `.sql` files are preserved;
+on a fresh server, do not copy the old raw archive into this deployment.
 
-Create Lightsail alarms for:
+Cleanup frees local storage permanently. Older raw inputs are no longer
+available for exact historical replays unless you deliberately backed them up.
+The cumulative event history and stable-ID state remain in the current database
+and clean export. An interrupted build retains only its retry/checkpoint state;
+inspect it before starting a different dated build.
 
-- instance status-check failure;
-- sustained high CPU;
-- low burst-capacity percentage;
-- unexpected network traffic.
+For a no-extra-storage local recovery checkpoint, keep the latest compressed
+clean export already produced. For host-loss recovery, keep one verified copy
+off-host or one rolling manual Lightsail snapshot. Additional snapshot storage
+costs USD 0.05/GB-month; do not enable an unbounded backup archive. Instance
+snapshots include attached disks. Stop builds/containers for a consistent manual
+recovery snapshot, then restart through `make publish-live`.
+[AWS snapshot billing](https://docs.aws.amazon.com/lightsail/latest/userguide/amazon-lightsail-frequently-asked-questions-faq-billing-and-account-management.html).
 
-Lightsail does not publish host RAM, swap, or filesystem-free metrics. Monitor
-those on the host or with an external agent. Useful commands are:
+Alert on service failure, low disk/RAM, backup age and stale snapshot date.
+Test a restore before treating any backup as reliable. A single Beacon URL only
+exposes the currently hosted dump; data versions that disappear between checks
+cannot be recovered by this application.
 
-```bash
-free -h
-swapon --show
-df -h /srv/ojs_api/data
-sudo -u ojs docker stats --no-stream
-systemctl list-timers ojs-api-update.timer
-journalctl -u ojs-api-update.service --since today
-sudo -u ojs docker compose -f /srv/ojs_api/docker-compose.yml \
-  logs --tail=200 mysql ojs-api
-```
-
-## 13. Keep the attached disk bounded
-
-A 1 TB disk requires active retention management. Every ~130 GB monthly raw
-snapshot consumes another large fraction before MySQL build files and clean
-exports.
-
-After every successful release:
-
-1. Verify the new JSON report, export sidecar, and release manifest.
-2. Copy the immutable raw dump, clean export, report, sidecars, and manifest to
-   versioned off-host storage. Preserve the report's source SHA-256.
-3. Retain at least two independent recoverable release copies.
-4. Restart Compose during a short maintenance window so its bind mount follows
-   the newest `mysql-current` target:
-
-   ```bash
-   cd /srv/ojs_api
-   sudo -u ojs docker compose down
-   sudo -u ojs docker compose up -d
-   curl --fail http://127.0.0.1:8000/health
-   ```
-
-5. Confirm both paths before considering an old build database for removal:
-
-   ```bash
-   readlink -f data/clean/mysql-current
-   sudo -u ojs docker inspect ojs-mysql --format \
-     '{{range .Mounts}}{{if eq .Destination "/var/lib/mysql"}}{{.Source}}{{end}}{{end}}'
-   find data/clean -maxdepth 1 -type d -name 'mysql-????-??-??' -print
-   ```
-
-   The first two commands must identify the same directory. Never remove that
-   directory, a `.building` directory under investigation, or the only copy of
-   a release. Review old candidates individually; cleanup is intentionally not
-   automated.
-
-6. Keep the newest raw snapshots locally and archive older ones before removing
-   them. Restore all dated raw files from the archive before any history replay.
-
-Take a manual Lightsail snapshot before filesystem cleanup. Do not treat a
-snapshot in the same account/Region as the only backup.
-
-## 14. When 16 GB Lightsail is no longer enough
-
-Reduce pressure in this order:
-
-1. Keep one metadata worker.
-2. Lower the serving buffer pool to 4 GB and its container limit to 6 GB.
-3. Lower the builder buffer pool to 1 GB.
-4. Move the initial/history build to a temporary larger host.
-5. Move the workload to EC2 with EBS if Lightsail burst CPU or attached-disk
-   throughput makes updates miss their operational window.
-
-Never fix an OOM by disabling the release guard, increasing concurrency, or
-allowing unlimited swap. The pipeline is restartable; preserving the live API
-and the integrity of its release history takes priority over build speed.
+If the first build exceeds 4 GB RAM despite the bounded profile, review its
+error/peak before changing settings. The 8 GB general-purpose bundle is USD
+44/month; it can reuse the attached disk. If disk fills, expand only by the
+measured requirement. These choices still avoid the prior 16 GB plus 1 TB
+default.

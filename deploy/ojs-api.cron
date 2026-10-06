@@ -1,0 +1,5 @@
+# Install as /etc/cron.d/ojs-api (root:root, mode 0644). Host timezone: UTC.
+# A running multi-day job is not restarted by the next daily check.
+SHELL=/bin/sh
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+17 3 * * * root /usr/bin/systemctl start --no-block ojs-api-update.service

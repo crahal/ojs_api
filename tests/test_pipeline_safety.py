@@ -4,6 +4,7 @@ import sys
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 import run_pipeline
@@ -38,6 +39,34 @@ def create_complete_release(clean: Path, version: str) -> tuple[Path, Path]:
 
 
 class PipelineSafetyTest(unittest.TestCase):
+    def test_force_rebuild_protects_live_pointer_even_when_candidate_is_newer(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            clean = root / "clean"
+            live = clean / "mysql-2026-01-01"
+            newer = clean / "mysql-2026-07-01"
+            live.mkdir(parents=True)
+            newer.mkdir()
+            (live / "keep").write_text("serving database")
+            (clean / "mysql-live").symlink_to(live.name)
+            (clean / "mysql-current").symlink_to(newer.name)
+            source = root / "pkpbeacon-2026-01-01.sql"
+            source.write_text(minimal_dump("2026-01-01"))
+            build_sql = Path(__file__).parents[1] / "sql" / "01_build_ojs_tables.sql"
+            with mock.patch.object(run_pipeline.MySQLTools, "discover"):
+                with self.assertRaisesRegex(run_pipeline.PipelineError, "mysql-live"):
+                    run_pipeline.build_snapshot_database(
+                        snapshot=run_pipeline.inspect_snapshot(source), clean_dir=clean,
+                        build_sql=build_sql, database="fixture", root_password="fixture",
+                        api_db_user="api", api_db_password="fixture",
+                        release_thresholds=run_pipeline.ReleaseThresholds(.1, .1, .1, .1),
+                        allow_anomalous_release=False, buffer_pool_size="128M",
+                        progress_seconds=1, force_rebuild=True, verify_existing=False,
+                        verify_source_checksum=False, full_rescan=False,
+                        publish_current=True, metadata_workers=1, resume_building=False,
+                    )
+            self.assertTrue((live / "keep").exists())
+
     def test_late_historical_file_is_never_silently_skipped(self):
         with TemporaryDirectory() as directory:
             root = Path(directory)

@@ -1,4 +1,4 @@
-ARG PYTHON_IMAGE=python:3.12.7-slim-bookworm
+ARG PYTHON_IMAGE=python:3.12.15-slim-bookworm
 FROM ${PYTHON_IMAGE}
 
 ENV PYTHONDONTWRITEBYTECODE=1 \

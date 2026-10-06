@@ -1,6 +1,5 @@
-# Install this entry in the ojs account's crontab, not root's crontab.
-# Do not install it when ojs-api-update.timer is enabled.
-SHELL=/bin/bash
+# Install in ROOT's crontab with sudo crontab -e. Do not enable the timer too.
+# systemd supplies the non-root account, memory limits, logs, and overlap guard.
+SHELL=/bin/sh
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-
-17 3 * * * cd /srv/ojs_api && ./scripts/automatic_update.sh >> /srv/ojs_api/data/automatic-update.log 2>&1
+17 3 * * * /usr/bin/systemctl start --no-block ojs-api-update.service

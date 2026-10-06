@@ -11,8 +11,9 @@ implements all six verbs:
 - `ListRecords`
 
 The REST endpoints remain available for provenance and event-cursor
-synchronization; those responses are JSON. There is no application rate limit
-for an authenticated user/key.
+synchronization; those responses are JSON. Defaults allow 200 records per REST
+page, 50 per OAI page and eight concurrent connections. There is no per-client
+rate limit. Retry temporary 503s/connection errors with exponential backoff.
 
 ## Credentials
 
@@ -187,14 +188,14 @@ Fetch its source aliases:
 
 ```bash
 curl --fail --user "$OJS_API_USERNAME:$OJS_API_KEY" \
-  "$OJS_BASE_URL/articles/12345/sources?after_id=0&limit=1000"
+  "$OJS_BASE_URL/articles/12345/sources?after_id=0&limit=200"
 ```
 
 Page active articles with stable keyset pagination:
 
 ```bash
 curl --fail --user "$OJS_API_USERNAME:$OJS_API_KEY" \
-  "$OJS_BASE_URL/articles?status=active&after_id=0&limit=1000"
+  "$OJS_BASE_URL/articles?status=active&after_id=0&limit=200"
 ```
 
 Use the response’s `next_after_id`; `null` means the scan is complete. Other
@@ -224,7 +225,7 @@ Then request events after the last transactionally committed cursor:
 
 ```bash
 curl --fail --user "$OJS_API_USERNAME:$OJS_API_KEY" \
-  "$OJS_BASE_URL/changes?after_event_id=123456&limit=1000"
+  "$OJS_BASE_URL/changes?after_event_id=123456&limit=200"
 ```
 
 For each item, use `current_operation`:
@@ -239,12 +240,12 @@ Advance the durable cursor only after that transaction commits. Repeating a
 page from the old cursor is safe. The durable value is the last returned
 `event.event_id`; `next_after_event_id` is `null` on the final page.
 
-The serving tables are replaced atomically during monthly updates, so each SQL
-statement sees complete old or new tables. Some HTTP endpoints perform more
-than one statement and can cross a release swap. Always save
-`high_watermark_event_id` before a long bootstrap and consume `/changes` from
-that saved cursor afterward; this reconciles both in-request and between-page
-release changes.
+The compact deployment keeps the old release available while building and
+briefly restarts the API/database at publication. Retry an interrupted request
+from its last committed cursor. Always save `high_watermark_event_id` before a
+long bootstrap and consume `/changes` from that saved cursor afterward; this
+reconciles release changes between pages. Legacy deployments using the online
+table-swap publisher can also cross a release between statements in one response.
 
 ## Lifecycle fields
 
