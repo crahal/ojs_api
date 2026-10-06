@@ -18,6 +18,14 @@ normally synchronize.
 1. **Discover it.** The daily cron checks the authenticated PKP Beacon gzip
    endpoint. If its HTTP validators are unchanged, there is no download or
    rebuild. An optional standalone HTML scraper is also available for archives.
+   Before source-changing work, the coordinator, direct pipeline and both
+   downloaders acquire the same raw-directory `.source-activity.lock`. Downloads
+   and processing are mutually exclusive for that directory. A busy invocation
+   exits successfully with `source_activity_busy`, without queueing work or
+   caching a new dump; the next daily check retries. Beacon's read-only `--check`
+   can still inspect HEAD/local status without GET requests or file changes.
+   The HTML scraper's `--check` may GET its index page, but does not download
+   data archives or write files.
 
 2. **Validate it without expanding it on disk.** Read the gzip in bounded
    chunks, check its CRC, hash both compressed and SQL bytes, and read the SQL
@@ -28,7 +36,11 @@ normally synchronize.
 3. **Process in date order.** If several files arrived, the oldest unprocessed
    file is processed first. A newly discovered file older than the published
    history is never silently skipped: the job stops and asks for a controlled
-   history rebuild.
+   history rebuild. A retained gzip already processed in that history is
+   recognized after its bulky clean export is pruned only when its current
+   validation metadata, committed manifest and checksummed report agree on the
+   original snapshot provenance. Missing evidence or changed input still stops
+   the job for review.
 
 4. **Build safely beside production.** The gzip streams directly into a new
    `mysql-YYYY-MM-DD.building` directory. The current API database remains
@@ -99,6 +111,12 @@ normally synchronize.
 
 ## Reading build progress
 
+The daily check runs at 03:17 UTC on a server configured for UTC: 04:17 London
+time during British Summer Time and 03:17 during GMT. It leaves an active build
+running and does not start an overlapping copy. One coordinator run can last
+up to `OJS_MAX_RUNTIME_HOURS=720` (30 days); the systemd service has a 31-day
+outer limit. Neither limit predicts how long the catalogue will take.
+
 The production service records progress in the system journal. Reconnect over
 SSH at any time and run:
 
@@ -148,6 +166,13 @@ so there is no measured whole-build ETA or honest global percentage. A stage's
 `completed` event also does not mean the release has passed its remaining gates
 or become live. A kill/reboot may prevent a final event: consult systemd status.
 
+Validated metadata-processing checkpoints can resume after interruption.
+Finalization, including deduplication and lifecycle work, cannot resume midway;
+an interrupted `finalizing` candidate must be rebuilt. Increasing the runtime
+setting does not change the deadline of a process already running, so applying
+it immediately requires a controlled restart with that rebuild cost. See the
+[restart procedure](HOW_TO_DEPLOY.md#failed-download-or-build).
+
 The deployment journal policy retains bounded recent diagnostic history and
 may prune old logs before 14 days when its size budget is reached. It covers
 the host's default journal, including other services. Small checksummed audit
@@ -171,6 +196,10 @@ For snapshot `YYYY-MM-DD`:
   identifies the release currently served by the API.
 - `pkpbeacon-cleanup-YYYY-MM-DD.json` records generated files removed after a
   successful release, including paths and byte counts.
+- `pkpbeacon-bootstrap-cleanup-YYYY-MM-DD.json` records deletion of an explicitly
+  approved historical server gzip and its metadata sidecar by the optional
+  post-publication hook. Here the date is the historical input's date, not the
+  newly published release. Local/off-host originals are not accessed.
 - `ojs_article_events` stores every API-visible event with stable article ID,
   before/after hashes, operation (`upsert` or `delete`), and reason.
 - `GET /changes?after_event_id=...` is the supported downstream cursor. It
@@ -202,6 +231,15 @@ Restore any pruned historical raw files from a deliberate backup first. Older
 event history stays in the current database, but old raw files are not kept
 indefinitely. Using a separate directory keeps the serving `mysql-live` database and its
 release pointers untouched while the audit is running.
+
+A separate clean-output directory does not bypass the shared source lock:
+commands with the same canonical raw-data directory remain mutually exclusive.
+The lock uses Linux `flock` on a local filesystem and releases automatically
+when its holders exit. Keep the lock file in place; deleting it can let two
+workers lock different files and run concurrently. See the
+[non-blocking availability check](LIGHTSAIL_DEPLOYMENT.md#8-install-the-daily-cron).
+The lock is advisory: manual downloads, `rsync` and direct file writes bypass
+these entry points. Do not add or replace raw inputs manually during a build.
 
 The implementation is split between `src/download_beacon.py` (discovery/download),
 `src/run_pipeline.py` (orchestration and reports),

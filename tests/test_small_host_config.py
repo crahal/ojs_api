@@ -10,6 +10,7 @@ from unittest.mock import patch
 PROJECT_ROOT = Path(__file__).parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 import run_pipeline
+import compact_update
 
 
 def example_environment() -> dict[str, str]:
@@ -58,6 +59,15 @@ class SmallHostConfigTest(unittest.TestCase):
             cron, r"(?m)^17 3 \* \* \* root /usr/bin/systemctl start --no-block ojs-api-update.service$"
         )
         self.assertNotIn("automatic_update.sh", cron)
+
+    def test_service_timeout_exceeds_the_coordinator_default(self):
+        env = example_environment()
+        with patch.dict(os.environ, {}, clear=True):
+            defaults = compact_update.parser().parse_args([])
+        self.assertEqual(float(env["OJS_MAX_RUNTIME_HOURS"]), defaults.max_runtime_hours)
+        service = (PROJECT_ROOT / "deploy/ojs-api-update.service").read_text()
+        days = int(re.search(r"^TimeoutStartSec=(\d+)d$", service, re.MULTILINE).group(1))
+        self.assertGreater(days * 24, defaults.max_runtime_hours)
 
 
 if __name__ == "__main__":

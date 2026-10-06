@@ -5,6 +5,11 @@ one processing worker, compressed data, and bounded local retention. Processing
 may take several days. The API keeps serving the previous release during the
 build; a successful release causes a short MySQL/API restart.
 
+The production HTTPS origin is `https://13.135.237.76`, using the attached static
+IPv4 address. No custom domain or DNS record is required. Configuration examples
+use `PUBLIC_IP` and `YOUR_EMAIL`; for this deployment replace them with
+`13.135.237.76` and `charlierahal@gmail.com` respectively.
+
 ## 1. Choose the cost and capacity
 
 Start with Ubuntu 24.04 LTS, x86-64, the general-purpose **4 GB / 2 vCPU /
@@ -50,8 +55,8 @@ cloning it below; uncommitted workstation edits are not transferred by Git.
 Never add `.env`, `.secrets`, or the local data archive to that commit.
 
 In Lightsail, create the OS-only instance in your chosen Region. Attach a static
-IPv4 address and point your API hostname's DNS A record to it. Set firewall
-rules on both IPv4 and IPv6: TCP 22 from your admin IP only, TCP 80/443 publicly.
+IPv4 address and keep it attached for the lifetime of the API endpoint. Set
+firewall rules on both IPv4 and IPv6: TCP 22 from your admin IP only, TCP 80/443 publicly.
 Keep ports 8000 and 3306 closed. Disable IPv6 if you will not configure it.
 [Firewall instructions](https://docs.aws.amazon.com/lightsail/latest/userguide/understanding-firewall-and-port-mappings-in-amazon-lightsail.html).
 
@@ -60,12 +65,33 @@ SSH as `ubuntu`, then install the basic tools and create the service account:
 ```bash
 sudo apt update
 sudo apt upgrade -y
-sudo apt install -y ca-certificates curl git gzip make openssl python3 tmux util-linux cron caddy
+sudo apt install -y ca-certificates curl git gzip make openssl python3 tmux util-linux cron
 sudo timedatectl set-timezone UTC
 sudo useradd --create-home --shell /bin/bash ojs
 sudo install -d -o ojs -g ojs /srv/ojs_api
 sudo -u ojs git clone YOUR_REPOSITORY_URL /srv/ojs_api
 ```
+
+Install Caddy from its official stable repository. The deployment uses Caddy
+**2.11.7**, current on 6 October 2026; Ubuntu 24.04's own 2.6.2 package lacks the
+ACME profile configuration needed here. The official package installs the
+`caddy` systemd service:
+
+```bash
+sudo apt install -y debian-keyring debian-archive-keyring apt-transport-https gnupg
+curl -1sLf https://dl.cloudsmith.io/public/caddy/stable/gpg.key |
+    sudo gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+curl -1sLf https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt |
+    sudo tee /etc/apt/sources.list.d/caddy-stable.list
+sudo chmod o+r /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+sudo chmod o+r /etc/apt/sources.list.d/caddy-stable.list
+sudo apt update
+sudo apt install -y caddy
+caddy version
+```
+
+[Official Caddy installation](https://caddyserver.com/docs/install#debian-ubuntu-raspbian),
+[2.11.7 release](https://github.com/caddyserver/caddy/releases/tag/v2.11.7).
 
 Attach the data SSD in the same Availability Zone. Identify the actual blank
 device using `lsblk`; the console's device name may appear as NVMe in Linux.
@@ -209,8 +235,18 @@ sudo -u ojs editor .env
 
 Set `MYSQL_ROOT_PASSWORD` to the random value, `OJS_HOST_UID/GID` to the account
 numbers, `OJS_MYSQL_IMAGE` to the exact host patch, `OJS_ADMIN_EMAIL` to your
-address, and `OJS_PUBLIC_BASE_URL` to the public HTTPS origin. Leave the small-host
-resource values at their defaults for the first build.
+address, and `OJS_PUBLIC_BASE_URL` to `https://PUBLIC_IP`, replacing `PUBLIC_IP`
+with the attached static IPv4 address. This deployment uses
+`OJS_ADMIN_EMAIL=charlierahal@gmail.com` and
+`OJS_PUBLIC_BASE_URL=https://13.135.237.76`. Leave the small-host resource values
+at their defaults for the first build.
+
+`OJS_MAX_RUNTIME_HOURS=720` allows 30 days per coordinator run; the service's
+`TimeoutStartSec=31d` is the outer limit. These are failure cutoffs, not an ETA.
+Changing `.env` or reloading a unit does not reset the deadline already captured
+by a running Python process. Applying a new deadline to an active build requires
+a controlled restart; read the
+[restart and checkpoint limits](HOW_TO_DEPLOY.md#failed-download-or-build) first.
 
 `OJS_PROGRESS_SECONDS=30` emits periodic progress while lengthy steps run.
 It accepts finite seconds from 1 through 3600. Start/completion events and SQL
@@ -241,10 +277,9 @@ sudo -u ojs -H /bin/bash -lc 'cd /srv/ojs_api && make lightsail-preflight'
 sudo -u ojs -H /bin/bash -lc 'cd /srv/ojs_api && make check-source'
 ```
 
-**Credential verification on 5 October 2026 returned HTTP 401 for HEAD and
-a one-byte GET.** Correct the private password before deployment; the check
-must authenticate successfully. No full remote dump was downloaded in that
-verification. Passwords never belong in cron entries, command arguments or Git.
+The source check must authenticate successfully before starting a download.
+If it returns HTTP 401, correct the private credential file and repeat the
+check. Passwords never belong in cron entries, command arguments or Git.
 
 ## 6. Build the API image and install the bounded service
 
@@ -346,25 +381,70 @@ sudo -u ojs -H /bin/bash -lc '
 '
 ```
 
-Edit `/etc/caddy/Caddyfile`, substituting the same hostname as `.env`:
+Copy the IP certificate template and edit it, replacing `PUBLIC_IP` and
+`YOUR_EMAIL` with the same IP address and administrator email as `.env`:
+
+```bash
+sudo install -o root -g root -m 644 deploy/Caddyfile.ip.example /etc/caddy/Caddyfile
+sudo editor /etc/caddy/Caddyfile
+```
+
+The resulting configuration has this form:
 
 ```caddyfile
-api.your-domain.example {
-    encode zstd gzip
+{
+    email YOUR_EMAIL
+    default_sni PUBLIC_IP
+}
+
+https://PUBLIC_IP {
+    tls {
+        issuer acme {
+            dir https://acme-v02.api.letsencrypt.org/directory
+            profile shortlived
+            disable_tlsalpn_challenge
+        }
+    }
+    encode gzip
     reverse_proxy 127.0.0.1:8000
+    handle_errors {
+        header Retry-After "60"
+        respond "The catalogue is temporarily unavailable. Please try again later." 503
+    }
 }
 ```
+
+Let’s Encrypt issues publicly trusted IP certificates with the `shortlived`
+profile, valid for 160 hours. Caddy obtains and renews them automatically.
+This configuration selects HTTP-01 validation, so leave TCP 80 publicly
+accessible for renewals as well as TCP 443 for clients. `default_sni` selects
+the IP certificate for clients that omit SNI when connecting to a numeric IP,
+including connections translated to the instance's private address.
+[Let’s Encrypt IP certificates](https://letsencrypt.org/2026/01/15/6day-and-ip-general-availability),
+[Caddy TLS configuration](https://caddyserver.com/docs/caddyfile/directives/tls),
+[default SNI](https://caddyserver.com/docs/caddyfile/options#default-sni).
 
 ```bash
 sudo caddy validate --config /etc/caddy/Caddyfile
 sudo systemctl enable --now caddy
 sudo systemctl reload caddy
-curl --fail https://api.your-domain.example/health
+sudo journalctl -u caddy -n 50 --no-pager
+curl --fail https://13.135.237.76/health
 ```
+
+Certificate issuance happens in the background; a running service alone does
+not prove issuance succeeded. Check HTTPS from your workstation with normal
+certificate verification before sending API credentials. Do not use `curl -k`
+or `tls internal` for this public API. Keep Caddy's certificate state under
+`/var/lib/caddy/.local/share/caddy` persistent and monitor renewal failures.
+If HTTPS is configured before the first release is ready, requests receive
+HTTP 503 with `Retry-After: 60` until the API starts.
 
 Check that an unauthenticated request to `/meta` returns 401. All data endpoints
 require the API user/key. The app has a bounded concurrency/page size, not a
 per-client rate limiter; use a proxy/WAF if shared clients require one.
+The complete authenticated API smoke test must wait until the first build has
+published successfully; a trusted HTTPS connection returning 503 is not that test.
 
 ## 8. Install the daily cron
 
@@ -377,7 +457,12 @@ sudo systemctl disable --now ojs-api-update.timer 2>/dev/null || true
 sudo install -o root -g root -m 644 deploy/ojs-api.cron /etc/cron.d/ojs-api
 sudo systemctl enable --now cron
 sudo cat /etc/cron.d/ojs-api
+timedatectl show --property=Timezone --value
 ```
+
+The server timezone must remain `UTC` because this cron file uses the server's
+clock. 03:17 UTC is 04:17 in London during British Summer Time and 03:17 during
+GMT. The timezone check above should print `UTC`.
 
 Do not install the optional systemd timer as well. If using `sudo crontab -e`
 instead, copy the entry in `deploy/ojs-api.crontab.example`; do not replace an
@@ -390,6 +475,68 @@ content changes are rejected for review instead of silently overwriting history.
 If an update is still building, the daily start leaves that single run alone;
 the next check happens after it finishes.
 
+All source-changing entry points share
+`/srv/ojs_api/data/raw/.source-activity.lock`: the coordinator, direct pipeline,
+Beacon downloader and optional HTML scraper. With the same raw-data directory,
+a download cannot overlap processing or another download. This also applies
+when two commands choose different clean-output directories. A busy manual
+command or new coordinator returns `source_activity_busy` with exit status 0
+and does not queue work, prefetch a dump or create a new download cache. The
+next daily cron invocation retries after the active work finishes. A cron start
+of the already active systemd service does not restart its running process.
+The read-only Beacon `--check` mode, exposed by `make check-source`, remains
+available for HEAD and local status checks without GET requests or file writes.
+The HTML scraper's `--check` can GET its index page, but does not download data
+archives or write files.
+This is an advisory lock used by the repository's entry points. Manual `curl`,
+`rsync` and direct filesystem writes do not participate; do not manually add or
+replace raw inputs while processing is active.
+
+Once the lock file exists, check its availability without starting work:
+
+```bash
+sudo flock -n /srv/ojs_api/data/raw/.source-activity.lock -c true
+echo $?
+```
+
+Exit status 1 means busy; 0 means the probe acquired and immediately released
+the lock. Other errors need investigation. This is only a point-in-time check:
+the next worker must still acquire its own lock. Never delete or replace this
+file to clear a lock, and do not use PID-file age as evidence of a stale lock.
+Linux `flock` ownership is released when the final holder closes or exits;
+the file itself remains.
+
+Use a local Linux filesystem with working `flock` semantics, and configure all
+entry points to use the same canonical raw-data directory. Separate copies or
+paths on filesystems without compatible locking do not provide this guarantee.
+Freshly started commands acquire the lock automatically and need no additional
+service dependency. For this deployment's already running process from before
+the locking upgrade, a temporary lock holder covers its remaining lifetime;
+the long build is not restarted solely to load the new locking code. This
+temporary migration mechanism is not needed for new installations.
+
+For an in-place upgrade, copy the shared-lock module and migration helper first,
+identify the existing coordinator and pipeline PIDs, and run this temporary
+guard as the same service account. Replace both PID placeholders; include each
+still-running process that must remain protected:
+
+```bash
+sudo systemd-run --unit=ojs-legacy-source-guard --property=Type=exec --uid=ojs --gid=ojs \
+    /usr/bin/python3 /srv/ojs_api/src/hold_legacy_source_lock.py \
+    --raw-dir /srv/ojs_api/data/raw \
+    --pid EXISTING_COORDINATOR_PID --pid EXISTING_PIPELINE_PID
+sudo journalctl -u ojs-legacy-source-guard --no-pager
+```
+
+Verify a JSON `guard-acquired` event and a busy lock probe before installing the
+updated entry points. Starting the transient unit alone does not prove the
+guard acquired its lock. It fails if a supplied process already exited, cannot
+be monitored, or the source lock is busy. Linux process handles prevent PID
+reuse from extending or shortening the wait. The guard retains the lock until
+all supplied processes have exited, even if a child outlives its parent, and
+then reports `guard-released`. Do not stop the guard while an old process still
+needs protection. New builds acquire their own lease automatically.
+
 ## 9. Retention, recovery and operating cost
 
 After verified publication, automatic cleanup removes older **managed** raw
@@ -398,6 +545,37 @@ newest input, current database, current clean export, and small audit files.
 Symlinks, mounted databases, incomplete builds and unrecognized legacy inputs
 are not blindly deleted. Existing user-supplied `.sql` files are preserved;
 on a fresh server, do not copy the old raw archive into this deployment.
+
+This deployment also has two explicitly approved historical bootstrap server
+copies: `data/raw/pkpbeacon-2026-01-01.sql.gz` and
+`data/raw/pkpbeacon-2026-07-01.sql.gz`, with their `.metadata.json` sidecars.
+The optional hook below removes only these named files after a successful
+update and verification of the authenticated live API. Install this template
+only when deletion of both dates has been explicitly approved; review its
+`--snapshot` arguments for any other deployment:
+
+```bash
+cd /srv/ojs_api
+sudo install -d -o root -g root -m 755 /etc/systemd/system/ojs-api-update.service.d
+sudo install -o root -g root -m 644 deploy/ojs-api-bootstrap-cleanup.conf.example /etc/systemd/system/ojs-api-update.service.d/40-bootstrap-cleanup.conf
+sudo systemctl daemon-reload
+```
+
+The drop-in runs this command as the service's `ExecStartPost`:
+
+```bash
+/usr/bin/python3 /srv/ojs_api/src/cleanup_bootstrap.py --project-root /srv/ojs_api --snapshot 2026-01-01 --snapshot 2026-07-01
+```
+
+Installing and reloading this hook does not require restarting an active build.
+The script defers when no release is live. It checks the live marker,
+authenticated API, retained release reports, source hashes and unchanged file
+bindings before deletion, and refuses unproven or changed targets. It retains
+one durable audit per historical date at
+`data/clean/pkpbeacon-bootstrap-cleanup-YYYY-MM-DD.json`; completed or absent
+targets require no further deletion on later runs. Local/off-host originals
+are never accessed. A proven retained historical gzip does not become a false
+late backfill merely because its old clean export has already been pruned.
 
 Cleanup frees local storage permanently. Older raw inputs are no longer
 available for exact historical replays unless you deliberately backed them up.

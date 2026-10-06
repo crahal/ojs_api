@@ -1,0 +1,6 @@
+# Optional: only install after explicitly approving these historical server
+# copies for deletion. The local/off-host originals are not accessed.
+# Runs after successful update/publication and checks the authenticated API
+# and retained source provenance before deleting either dated gzip/sidecar.
+[Service]
+ExecStartPost=/usr/bin/python3 /srv/ojs_api/src/cleanup_bootstrap.py --project-root /srv/ojs_api --snapshot 2026-01-01 --snapshot 2026-07-01

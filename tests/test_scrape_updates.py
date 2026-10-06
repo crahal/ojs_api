@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import contextlib
 import gzip
 import io
+import json
 import os
 import sys
+import threading
 import unittest
 from email.message import Message
 from pathlib import Path
@@ -20,6 +23,33 @@ def sql_dump(version: str) -> bytes:
         b"CREATE TABLE example (id INTEGER);\n"
         + f"-- Dump completed on {version} 12:00:00\n".encode("ascii")
     )
+
+
+@contextlib.contextmanager
+def busy_source(raw_dir):
+    ready, release = threading.Event(), threading.Event()
+    errors = []
+
+    def hold():
+        try:
+            with scrape_updates.source_activity(raw_dir):
+                ready.set()
+                release.wait(10)
+        except BaseException as exc:
+            errors.append(exc)
+            ready.set()
+
+    worker = threading.Thread(target=hold)
+    worker.start()
+    try:
+        if not ready.wait(2):
+            raise AssertionError("source lock holder did not start")
+        if errors:
+            raise errors[0]
+        yield
+    finally:
+        release.set()
+        worker.join(2)
 
 
 class FakeResponse(io.BytesIO):
@@ -50,6 +80,81 @@ class FakeOpener:
 
 
 class ScrapeUpdatesTest(unittest.TestCase):
+    def scrape(self, raw_dir, *, check_only=False):
+        return scrape_updates.scrape(
+            index_url="https://example.com/ojs-data/", raw_dir=raw_dir,
+            username=None, password=None, timeout=10, allow_cross_origin=False,
+            check_only=check_only, max_expanded_bytes=1024**2)
+
+    def test_busy_scrape_skips_before_fetching_index(self):
+        with TemporaryDirectory() as directory:
+            raw = Path(directory)
+            with busy_source(raw), patch.object(scrape_updates, "fetch_index") as fetch:
+                with self.assertRaises(scrape_updates.SourceActivityBusy):
+                    self.scrape(raw)
+                fetch.assert_not_called()
+
+    def test_busy_cli_emits_clear_skipped_json(self):
+        output = io.StringIO()
+        with TemporaryDirectory() as directory:
+            raw = Path(directory)
+            with busy_source(raw), patch.object(scrape_updates, "fetch_index") as fetch, \
+                    contextlib.redirect_stdout(output):
+                code = scrape_updates.main(["--raw-dir", str(raw)])
+            self.assertEqual(code, 0)
+            self.assertEqual(json.loads(output.getvalue()),
+                             {"status": "skipped", "reason": "source_activity_busy"})
+            fetch.assert_not_called()
+
+    def test_busy_public_download_does_not_connect_or_change_files(self):
+        snapshot = scrape_updates.RemoteSnapshot(
+            "2026-07-01", "https://example.com/pkpbeacon-2026-07-01.sql.gz", True)
+        with TemporaryDirectory() as directory:
+            raw = Path(directory)
+            with busy_source(raw), patch.object(scrape_updates, "build_opener") as opener:
+                before = set(raw.iterdir())
+                with self.assertRaises(scrape_updates.SourceActivityBusy):
+                    scrape_updates.download_snapshot(
+                        snapshot, raw, index_url="https://example.com/", username=None,
+                        password=None, timeout=10, allow_cross_origin=False)
+                self.assertEqual(set(raw.iterdir()), before)
+                opener.assert_not_called()
+
+    def test_read_only_check_does_not_acquire_lock_or_create_raw_directory(self):
+        html = '<a href="pkpbeacon-2026-07-01.sql.gz">snapshot</a>'
+        with TemporaryDirectory() as directory:
+            raw = Path(directory) / "not-created"
+            with patch.object(scrape_updates, "source_activity",
+                              side_effect=AssertionError("read-only checks must not lock")), \
+                    patch.object(scrape_updates, "fetch_index", return_value=html):
+                result = self.scrape(raw, check_only=True)
+            self.assertEqual(result.missing, ("pkpbeacon-2026-07-01.sql",))
+            self.assertFalse(raw.exists())
+
+    def test_other_raw_directory_is_independent_and_nested_download_works(self):
+        html = '<a href="pkpbeacon-2026-07-01.sql.gz">snapshot</a>'
+        opener = FakeOpener(gzip.compress(sql_dump("2026-07-01")))
+        with TemporaryDirectory() as directory:
+            raw = Path(directory) / "selected"
+            with busy_source(Path(directory) / "occupied"), \
+                    patch.object(scrape_updates, "fetch_index", return_value=html), \
+                    patch.object(scrape_updates, "build_opener", return_value=opener):
+                result = self.scrape(raw)
+            self.assertEqual(result.downloaded, ("pkpbeacon-2026-07-01.sql",))
+            self.assertTrue((raw / "pkpbeacon-latest.sql").is_symlink())
+
+    def test_invalid_inherited_capability_is_an_error_not_a_skipped_scrape(self):
+        output, errors = io.StringIO(), io.StringIO()
+        with TemporaryDirectory() as directory, \
+                patch.dict(os.environ, {"OJS_SOURCE_ACTIVITY_FD": "-1"}), \
+                patch.object(scrape_updates, "fetch_index") as fetch, \
+                contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+            code = scrape_updates.main(["--raw-dir", directory])
+        self.assertEqual(code, 1)
+        self.assertEqual(output.getvalue(), "")
+        self.assertIn("invalid inherited source activity descriptor", errors.getvalue())
+        fetch.assert_not_called()
+
     def test_index_parser_is_deterministic_and_prefers_gzip(self):
         html = """
         <a href="pkpbeacon-2026-07-01.sql">plain</a>

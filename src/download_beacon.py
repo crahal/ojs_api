@@ -17,6 +17,7 @@ import shutil
 import sys
 import tempfile
 import zlib
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from email.utils import format_datetime, parsedate_to_datetime
@@ -26,6 +27,7 @@ from urllib.parse import urljoin, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from progress_logging import Progress, progress_interval
+from source_activity import SourceActivityBusy, source_activity
 
 DEFAULT_URL = "https://beacon.publicknowledgeproject.org/mysql/pkpbeacon.gz"
 DEFAULT_USERNAME = "beacon-research"
@@ -551,16 +553,17 @@ def download_snapshot(
     ``version`` remains a compatibility date hint; the SQL footer is authoritative.
     ``expected_version`` optionally enforces a requested date.
     """
-    _require_secure_url(url, allow_insecure_localhost)
-    raw_dir.mkdir(parents=True, exist_ok=True)
-    with (raw_dir / ".pkpbeacon-download.lock").open("a") as lock:
-        try:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            raise RuntimeError("another Beacon download is already running") from None
-        return _download_snapshot_locked(
-            url, username, password, raw_dir, remote, timeout, force, expected_version
-        )
+    with source_activity(raw_dir):
+        _require_secure_url(url, allow_insecure_localhost)
+        raw_dir.mkdir(parents=True, exist_ok=True)
+        with (raw_dir / ".pkpbeacon-download.lock").open("a") as lock:
+            try:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise RuntimeError("another Beacon download is already running") from None
+            return _download_snapshot_locked(
+                url, username, password, raw_dir, remote, timeout, force, expected_version
+            )
 
 
 def _download_snapshot_locked(
@@ -749,78 +752,87 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _execute(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    progress_interval()
+    file_username, file_password = read_credentials(args.credentials_file)
+    username = (
+        args.username
+        or os.environ.get("PKP_BEACON_USERNAME")
+        or file_username
+        or DEFAULT_USERNAME
+    )
+    password = os.environ.get("PKP_BEACON_PASSWORD") or file_password
+    if args.prompt_password:
+        password = getpass.getpass("PKP Beacon password: ")
+    if not password:
+        parser.error(
+            "set PKP_BEACON_PASSWORD, provide a private credentials file, or pass --prompt-password"
+        )
+    remote = probe_remote(
+        args.url,
+        username,
+        password,
+        args.timeout,
+        allow_insecure_localhost=args.allow_insecure_localhost,
+    )
+    version = snapshot_version(remote, args.version)
+    if args.check:
+        existing = known_remote_snapshot(args.raw_dir, args.url, remote)
+        if (
+            args.version
+            and existing
+            and SNAPSHOT_PATTERN.fullmatch(existing.name).group(1) != version
+        ):
+            raise RuntimeError("requested version differs from the SQL footer date")
+        result = {
+            "remote": _remote_identity(remote),
+            "known_snapshot": str(existing) if existing else None,
+            "needs_download": bool(args.force or existing is None),
+            "date_hint": version,
+        }
+        if args.json:
+            print(json.dumps(result, sort_keys=True))
+        else:
+            print(f"Remote size: {_format_bytes(remote.size)}")
+            print(
+                f"Last modified: {result['remote']['last_modified'] or 'not provided'}"
+            )
+            print(f"ETag: {remote.etag or 'not provided'}")
+            print(
+                f"Known snapshot: {existing or 'none; SQL footer determines the date'}"
+            )
+            print(f"Download needed: {'yes' if result['needs_download'] else 'no'}")
+        return 0
+    download_snapshot(
+        args.url,
+        username,
+        password,
+        args.raw_dir,
+        version,
+        remote,
+        args.timeout,
+        args.force,
+        allow_insecure_localhost=args.allow_insecure_localhost,
+        expected_version=args.version,
+    )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
     if args.json and not args.check:
         parser.error("--json requires --check")
     try:
-        progress_interval()
-        file_username, file_password = read_credentials(args.credentials_file)
-        username = (
-            args.username
-            or os.environ.get("PKP_BEACON_USERNAME")
-            or file_username
-            or DEFAULT_USERNAME
-        )
-        password = os.environ.get("PKP_BEACON_PASSWORD") or file_password
-        if args.prompt_password:
-            password = getpass.getpass("PKP Beacon password: ")
-        if not password:
-            parser.error(
-                "set PKP_BEACON_PASSWORD, provide a private credentials file, or pass --prompt-password"
-            )
-        remote = probe_remote(
-            args.url,
-            username,
-            password,
-            args.timeout,
-            allow_insecure_localhost=args.allow_insecure_localhost,
-        )
-        version = snapshot_version(remote, args.version)
-        if args.check:
-            existing = known_remote_snapshot(args.raw_dir, args.url, remote)
-            if (
-                args.version
-                and existing
-                and SNAPSHOT_PATTERN.fullmatch(existing.name).group(1) != version
-            ):
-                raise RuntimeError("requested version differs from the SQL footer date")
-            result = {
-                "remote": _remote_identity(remote),
-                "known_snapshot": str(existing) if existing else None,
-                "needs_download": bool(args.force or existing is None),
-                "date_hint": version,
-            }
-            if args.json:
-                print(json.dumps(result, sort_keys=True))
-            else:
-                print(f"Remote size: {_format_bytes(remote.size)}")
-                print(
-                    f"Last modified: {result['remote']['last_modified'] or 'not provided'}"
-                )
-                print(f"ETag: {remote.etag or 'not provided'}")
-                print(
-                    f"Known snapshot: {existing or 'none; SQL footer determines the date'}"
-                )
-                print(f"Download needed: {'yes' if result['needs_download'] else 'no'}")
-            return 0
-        download_snapshot(
-            args.url,
-            username,
-            password,
-            args.raw_dir,
-            version,
-            remote,
-            args.timeout,
-            args.force,
-            allow_insecure_localhost=args.allow_insecure_localhost,
-            expected_version=args.version,
-        )
+        # A read-only HEAD check must neither create a lock nor acquire one.
+        with nullcontext() if args.check else source_activity(args.raw_dir):
+            return _execute(args, parser)
+    except SourceActivityBusy:
+        print(json.dumps({"status": "skipped", "reason": "source_activity_busy"}, sort_keys=True))
+        return 0
     except (RuntimeError, ValueError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
-    return 0
 
 
 if __name__ == "__main__":

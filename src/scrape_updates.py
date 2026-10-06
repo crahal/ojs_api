@@ -11,6 +11,7 @@ import os
 import re
 import sys
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import date
 from html.parser import HTMLParser
@@ -18,6 +19,8 @@ from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import unquote, urljoin, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
+
+from source_activity import SourceActivityBusy, SourceActivityError, source_activity
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_INDEX_URL = "https://example.com/ojs-data/"
@@ -311,6 +314,25 @@ def download_snapshot(
     max_expanded_bytes: int = DEFAULT_MAX_EXPANDED_GB * 1024**3,
 ) -> bool:
     """Download one immutable snapshot; return True only when newly installed."""
+    with source_activity(raw_dir):
+        return _download_snapshot_locked(
+            snapshot, raw_dir, index_url=index_url, username=username,
+            password=password, timeout=timeout, allow_cross_origin=allow_cross_origin,
+            max_expanded_bytes=max_expanded_bytes,
+        )
+
+
+def _download_snapshot_locked(
+    snapshot: RemoteSnapshot,
+    raw_dir: Path,
+    *,
+    index_url: str,
+    username: str | None,
+    password: str | None,
+    timeout: float,
+    allow_cross_origin: bool,
+    max_expanded_bytes: int,
+) -> bool:
     raw_dir.mkdir(parents=True, exist_ok=True)
     destination = raw_dir / f"pkpbeacon-{snapshot.version}.sql"
     if destination.exists():
@@ -402,6 +424,25 @@ def publish_latest_pointer(raw_dir: Path) -> Path:
 
 
 def scrape(
+    *,
+    index_url: str,
+    raw_dir: Path,
+    username: str | None,
+    password: str | None,
+    timeout: float,
+    allow_cross_origin: bool,
+    check_only: bool,
+    max_expanded_bytes: int,
+) -> ScrapeResult:
+    with nullcontext() if check_only else source_activity(raw_dir):
+        return _scrape_locked(
+            index_url=index_url, raw_dir=raw_dir, username=username, password=password,
+            timeout=timeout, allow_cross_origin=allow_cross_origin,
+            check_only=check_only, max_expanded_bytes=max_expanded_bytes,
+        )
+
+
+def _scrape_locked(
     *,
     index_url: str,
     raw_dir: Path,
@@ -536,7 +577,10 @@ def main(argv: list[str] | None = None) -> int:
             check_only=args.check,
             max_expanded_bytes=args.max_expanded_gb * 1024**3,
         )
-    except (OSError, ScrapeError) as exc:
+    except SourceActivityBusy:
+        print(json.dumps({"status": "skipped", "reason": "source_activity_busy"}, sort_keys=True))
+        return 0
+    except (OSError, ScrapeError, SourceActivityError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 

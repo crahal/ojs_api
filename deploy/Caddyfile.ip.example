@@ -1,0 +1,22 @@
+# Replace PUBLIC_IP and YOUR_EMAIL before installing as /etc/caddy/Caddyfile.
+# Requires a current Caddy release with ACME certificate-profile support.
+{
+	email YOUR_EMAIL
+	default_sni PUBLIC_IP
+}
+
+https://PUBLIC_IP {
+	tls {
+		issuer acme {
+			dir https://acme-v02.api.letsencrypt.org/directory
+			profile shortlived
+			disable_tlsalpn_challenge
+		}
+	}
+	encode gzip
+	reverse_proxy 127.0.0.1:8000
+	handle_errors {
+		header Retry-After "60"
+		respond "The catalogue is temporarily unavailable. Please try again later." 503
+	}
+}

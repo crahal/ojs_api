@@ -25,6 +25,33 @@ def progress_events(output):
             for line in output.splitlines() if line.startswith("[progress] ")]
 
 
+@contextlib.contextmanager
+def busy_source(raw_dir):
+    ready, release = threading.Event(), threading.Event()
+    errors = []
+
+    def hold():
+        try:
+            with download_beacon.source_activity(raw_dir):
+                ready.set()
+                release.wait(10)
+        except BaseException as exc:
+            errors.append(exc)
+            ready.set()
+
+    worker = threading.Thread(target=hold)
+    worker.start()
+    try:
+        if not ready.wait(2):
+            raise AssertionError("source lock holder did not start")
+        if errors:
+            raise errors[0]
+        yield
+    finally:
+        release.set()
+        worker.join(2)
+
+
 class HeartbeatOutput(io.StringIO):
     def __init__(self):
         super().__init__()
@@ -205,6 +232,78 @@ class DownloadBeaconTest(unittest.TestCase):
         self.assertEqual(metadata["uncompressed_size"], len(BeaconHandler.sql))
         self.assertEqual((self.raw_dir / "pkpbeacon-latest.sql.gz").resolve(), result)
         self.assertFalse((self.raw_dir / download_beacon.PART_NAME).exists())
+
+    def test_busy_cli_skips_before_credentials_prompt_or_head(self):
+        output = io.StringIO()
+        with busy_source(self.raw_dir), contextlib.redirect_stdout(output), \
+                patch.object(download_beacon, "read_credentials") as credentials, \
+                patch.object(download_beacon.getpass, "getpass") as prompt, \
+                patch.object(download_beacon, "probe_remote") as probe:
+            code = download_beacon.main([
+                "--raw-dir", str(self.raw_dir), "--url", self.url, "--prompt-password"])
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(output.getvalue()),
+                         {"status": "skipped", "reason": "source_activity_busy"})
+        credentials.assert_not_called()
+        prompt.assert_not_called()
+        probe.assert_not_called()
+        self.assertEqual(self.server.requests, [])
+
+    def test_busy_public_download_does_not_connect_or_create_download_files(self):
+        remote = download_beacon.RemoteFile(len(self.server.payload), None, '"snapshot-one"')
+        with busy_source(self.raw_dir), patch.object(download_beacon, "build_opener") as opener:
+            before = set(self.raw_dir.iterdir())
+            with self.assertRaises(download_beacon.SourceActivityBusy):
+                self.download(remote)
+            self.assertEqual(set(self.raw_dir.iterdir()), before)
+        opener.assert_not_called()
+        self.assertEqual(self.server.requests, [])
+
+    def test_other_raw_directory_is_independent_of_busy_source(self):
+        occupied = self.raw_dir / "another-source"
+        with busy_source(occupied):
+            result = self.download()
+        self.assertEqual(result.read_bytes(), self.server.payload)
+
+    def test_normal_cli_can_nest_public_download_under_shared_lock(self):
+        with patch.dict(os.environ, {"PKP_BEACON_USERNAME": BeaconHandler.username,
+                                     "PKP_BEACON_PASSWORD": BeaconHandler.password}), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            code = download_beacon.main([
+                "--raw-dir", str(self.raw_dir), "--url", self.url,
+                "--credentials-file", str(self.raw_dir / "absent.ini"),
+                "--allow-insecure-localhost"])
+        self.assertEqual(code, 0)
+        self.assertEqual([method for method, _ in self.server.requests], ["HEAD", "GET"])
+        self.assertTrue((self.raw_dir / "pkpbeacon-2026-07-01.sql.gz").exists())
+
+    def test_read_only_check_bypasses_lock_and_does_not_create_raw_directory(self):
+        raw = self.raw_dir / "not-created"
+        output = io.StringIO()
+        with patch.dict(os.environ, {"PKP_BEACON_USERNAME": BeaconHandler.username,
+                                     "PKP_BEACON_PASSWORD": BeaconHandler.password}), \
+                patch.object(download_beacon, "source_activity",
+                             side_effect=AssertionError("read-only checks must not lock")), \
+                contextlib.redirect_stdout(output), contextlib.redirect_stderr(io.StringIO()):
+            code = download_beacon.main([
+                "--raw-dir", str(raw), "--url", self.url,
+                "--credentials-file", str(self.raw_dir / "absent.ini"),
+                "--check", "--json", "--allow-insecure-localhost"])
+        self.assertEqual(code, 0)
+        self.assertTrue(json.loads(output.getvalue())["needs_download"])
+        self.assertEqual([method for method, _ in self.server.requests], ["HEAD"])
+        self.assertFalse(raw.exists())
+
+    def test_invalid_inherited_capability_is_an_error_not_a_skipped_download(self):
+        output, errors = io.StringIO(), io.StringIO()
+        with patch.dict(os.environ, {"OJS_SOURCE_ACTIVITY_FD": "-1"}), \
+                patch.object(download_beacon, "probe_remote") as probe, \
+                contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+            code = download_beacon.main(["--raw-dir", str(self.raw_dir)])
+        self.assertEqual(code, 1)
+        self.assertEqual(output.getvalue(), "")
+        self.assertIn("invalid inherited source activity descriptor", errors.getvalue())
+        probe.assert_not_called()
 
     def test_daily_head_is_noop_when_modified_date_differs_from_footer(self):
         result = self.download()

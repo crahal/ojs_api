@@ -31,6 +31,7 @@ import download_beacon
 import publish_live
 import run_pipeline
 from progress_logging import Progress, progress_interval
+from source_activity import SourceActivityBusy, source_activity, source_activity_child_options
 
 ROOT = Path(__file__).resolve().parents[1]
 DATE = r"\d{4}-\d{2}-\d{2}"
@@ -190,10 +191,11 @@ class Runner:
         return result.stdout
 
     def child(self, command: list[str], *, cwd: Path, env: dict,
-              reserve_check, timeout: float) -> None:
+              reserve_check, timeout: float, pass_fds: tuple[int, ...] = ()) -> None:
         # Interrupt Python first so its finally block shuts down local mysqld;
         # client subprocesses are interrupted with the same process group.
-        process = subprocess.Popen(command, cwd=cwd, env=env, start_new_session=True)
+        process = subprocess.Popen(command, cwd=cwd, env=env, pass_fds=pass_fds,
+                                   start_new_session=True)
         deadline = time.monotonic() + timeout
         try:
             while process.poll() is None:
@@ -266,7 +268,8 @@ class Coordinator:
         # The child reports data progress. Parent heartbeats only show that
         # supervision continues; reserve checks must not reset data-idle time.
         with Progress(stage, disk_path=self.clean, step="supervise-child"):
-            self.runner.child(command, cwd=self.root, env=self.env,
+            self.runner.child(command, cwd=self.root,
+                              **source_activity_child_options(self.raw, self.env),
                               reserve_check=lambda: self.capacity(self.args.reserve_gb),
                               timeout=remaining)
 
@@ -624,7 +627,9 @@ class Coordinator:
         if self.args.check:
             return {"probe": self.probe(), "live": str(live_directory(self.clean)) if self.clean.exists() and live_directory(self.clean) else None,
                     "recovery_pending": self.journal.exists()}
-        with automatic_lock(self.clean):
+        # Keep source exclusion through download, wrangling and publication.
+        # Only the intended downloader/pipeline children inherit this lease.
+        with source_activity(self.raw), automatic_lock(self.clean):
             with run_pipeline.pipeline_lock(self.clean), publish_live.publisher_lock(self.root):
                 self.recover()
             if not self.args.publish_only:
@@ -669,7 +674,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--no-prune", action="store_true", help="keep prior generated releases after successful promotion")
     result.add_argument("--min-free-gb", type=float, default=float(os.getenv("OJS_MIN_FREE_GB", "20")))
     result.add_argument("--reserve-gb", type=float, default=float(os.getenv("OJS_DISK_RESERVE_GB", "8")))
-    result.add_argument("--max-runtime-hours", type=float, default=float(os.getenv("OJS_MAX_RUNTIME_HOURS", "168")))
+    result.add_argument("--max-runtime-hours", type=float, default=float(os.getenv("OJS_MAX_RUNTIME_HOURS", "720")))
     result.add_argument("--health-timeout", type=float, default=300)
     result.add_argument("--api-url", default=f"http://127.0.0.1:{os.getenv('OJS_API_PORT', '8000')}")
     return result
@@ -688,6 +693,10 @@ def main(argv=None) -> int:
     try:
         progress_interval()
         print(json.dumps(Coordinator(args).execute(), sort_keys=True))
+        return 0
+    except SourceActivityBusy:
+        print(json.dumps({"status": "skipped", "reason": "source_activity_busy",
+                          "message": "Download or wrangling already in progress; no new download started."}))
         return 0
     except subprocess.TimeoutExpired:
         # Also protect timeouts raised by nested pipeline/control operations.

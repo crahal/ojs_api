@@ -5,14 +5,22 @@ installation, cost assumptions, private credentials, initial build, TLS and
 daily cron. The default is now 4 GB RAM, compressed storage and a brief restart
 at publication. The previous 16 GB/1 TB layout is no longer the recommendation.
 
+Production uses `https://13.135.237.76` with a publicly trusted IP certificate;
+no custom domain is required. Caddy 2.11.7 from its official repository manages
+the Let’s Encrypt `shortlived` certificate and forwards to `127.0.0.1:8000`.
+Keep public TCP 80 available for HTTP-01 renewals and TCP 443 for clients. See
+the [IP HTTPS configuration](LIGHTSAIL_DEPLOYMENT.md#7-smoke-test-the-api-and-configure-https).
+
 ## Production entry point
 
 Install `deploy/ojs-api-update.service`, `deploy/journald-ojs-api.conf` and
 `deploy/ojs-api.cron` as shown in the Lightsail guide. The cron runs daily at
-03:17 UTC and starts the service; systemd
-runs it as `ojs` with a 2 GiB memory limit, 1 GiB swap allowance and bounded
-runtime. A multi-day run cannot overlap itself. Do not also enable the optional
-timer. `scripts/automatic_update.sh` sources the private environment and calls
+03:17 UTC and starts the service; keep the server timezone set to `UTC`. This is
+04:17 in London during British Summer Time and 03:17 during GMT. Systemd runs
+it as `ojs` with a 2 GiB memory limit and 1 GiB swap allowance. The coordinator's
+`OJS_MAX_RUNTIME_HOURS=720` permits 30 days, with `TimeoutStartSec=31d` as the
+service's outer limit. A multi-day run cannot overlap itself. Do not also enable
+the optional timer. `scripts/automatic_update.sh` sources the private environment and calls
 `src/compact_update.py`; source passwords are read from a private INI file.
 
 The entire service group is capped separately from the serving MySQL/API
@@ -38,6 +46,18 @@ Unknown legacy files, symlinked artifacts, mounted directories and incomplete
 builds are protected. Migrate old files deliberately; a fresh deployment should
 start with an empty data tree. Cleanup is permanent, so choose a bounded off-host
 backup if exact historical inputs must remain available.
+
+The optional `deploy/ojs-api-bootstrap-cleanup.conf.example` adds an
+`ExecStartPost` for the explicitly approved server copies dated `2026-01-01`
+and `2026-07-01`. It checks the authenticated live API, release marker, retained
+reports and stat-bound source hashes before removing only those old gzips and
+their metadata sidecars. No live release means deferred cleanup; missing or
+changed proof prevents deletion, and already removed targets are a no-op.
+Per-date audits remain in
+`data/clean/pkpbeacon-bootstrap-cleanup-YYYY-MM-DD.json`. Local/off-host originals
+are untouched. Follow the [hook installation instructions](LIGHTSAIL_DEPLOYMENT.md#9-retention-recovery-and-operating-cost)
+after approving the exact dates; `daemon-reload` is sufficient, without
+restarting the active build.
 
 ## Monitoring
 
@@ -94,18 +114,39 @@ on the chosen instance before claiming production capacity.
 
 ## Failed download or build
 
-An HTTP 401 means the Beacon credential was rejected; update only the private
-credential file. The supplied credential returned 401 during the 5 October
-2026 deployment check. Re-run `make check-source` after correcting it.
+An HTTP 401 from Beacon means its credential was rejected; update only the
+private credential file and re-run `make check-source` after correcting it.
 
 Downloads resume only when a saved remote identity still matches. Changed or
 unknown validators invalidate a partial; gzip CRC/footer/hash validation must
 pass before publication. An immutable same-date revision stops for review.
 
-An interrupted pipeline resumes its validated metadata checkpoint when
-possible; otherwise only generated, unfinished state is rebuilt. Keep the
-failed report/log while investigating. Increase disk/RAM only after seeing
-which resource failed; do not bypass release guards to solve resource errors.
+An interrupted pipeline can resume a validated checkpoint during metadata
+processing. Finalization has no resumable checkpoint: interrupting the
+`finalizing` phase requires rebuilding the generated candidate, including work
+already done in that phase. The previous serving release remains separate.
+Keep the failed report/log while investigating. Increase disk/RAM only after
+seeing which resource failed; do not bypass release guards to solve resource
+errors.
+
+The 30-day coordinator deadline is captured when its Python process starts.
+Editing `.env` and running `systemctl daemon-reload` does not extend that running
+process's deadline. To apply the new limit to an existing process, first inspect
+its stage and plan for the checkpoint limits above. Then perform a controlled
+stop, install the service and edit the private environment, and start again:
+
+```bash
+sudo systemctl stop ojs-api-update.service
+sudo -u ojs editor /srv/ojs_api/.env  # Set OJS_MAX_RUNTIME_HOURS=720.
+sudo install -o root -g root -m 644 /srv/ojs_api/deploy/ojs-api-update.service /etc/systemd/system/ojs-api-update.service
+sudo systemctl daemon-reload
+sudo systemctl start --no-block ojs-api-update.service
+sudo journalctl -u ojs-api-update.service -f -o short-iso
+```
+
+Do not restart an advancing finalization merely to refresh its configuration.
+If it can finish before the active cutoff, let it finish and apply new limits
+to the next run. The 30-day limit is a cutoff, not a promised completion time.
 
 ## Release recovery
 

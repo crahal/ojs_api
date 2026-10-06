@@ -24,8 +24,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import BinaryIO, Callable
 
-from download_beacon import validate_cached_snapshot
+from download_beacon import read_validated_metadata, validate_cached_snapshot
 from progress_logging import Progress, progress_interval
+from source_activity import (
+    SourceActivityBusy, SourceActivityError, source_activity,
+    source_activity_child_options,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_RAW_DIR = PROJECT_ROOT / "data" / "raw"
@@ -393,6 +397,71 @@ def release_artifacts_complete(clean_dir: Path, version: str) -> bool:
     return all(manifest.get(key) == value for key, value in expected.items()) and all(
         value is not None for key, value in expected.items() if key.endswith("sha256")
     )
+
+
+def retained_snapshot_matches_release(snapshot: Snapshot, clean_dir: Path) -> bool:
+    """Recognize completed history after its bulky clean export was pruned.
+
+    Require the retained commit marker and checksummed report to bind the input
+    to its original SQL hash. Only a current, stat-bound gzip validation cache
+    can supply that hash without rescanning a potentially enormous raw file.
+    """
+    if not snapshot.path.name.endswith(".gz"):
+        return False
+    metadata = read_validated_metadata(snapshot.path)
+    if metadata is None:
+        return False
+    report_path = change_report_path(clean_dir, snapshot.version)
+    try:
+        documents = []
+        for path in (release_manifest_path(clean_dir, snapshot.version), report_path):
+            with path.open("rb") as source:
+                content = source.read(BUFFER_SIZE + 1)
+            if len(content) > BUFFER_SIZE:
+                return False
+            document = json.loads(content)
+            if not isinstance(document, dict):
+                return False
+            documents.append(document)
+        manifest, report = documents
+        report_sha256 = hashlib.sha256(content).hexdigest()
+        expected_manifest = {
+            "schema_version": 1,
+            "snapshot_date": snapshot.version,
+            "clean_export_filename": clean_export_path(clean_dir, snapshot.version).name,
+            "change_report_filename": report_path.name,
+            "change_report_sha256": report_sha256,
+        }
+        if any(manifest.get(key) != value for key, value in expected_manifest.items()):
+            return False
+        export_sha256 = manifest.get("clean_export_sha256")
+        if not isinstance(export_sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", export_sha256):
+            return False
+        if _declared_checksum(report_path) != report_sha256:
+            return False
+        recorded = report.get("snapshot")
+        if report.get("schema_version") != 1 or not isinstance(recorded, dict):
+            return False
+        expected_source = {
+            "date": snapshot.version,
+            "completed_at": snapshot.completed_at.isoformat(),
+            "source_size_bytes": snapshot.size,
+            "source_sha256": metadata["uncompressed_sha256"],
+        }
+        # Compression may change the filename without changing the logical SQL.
+        source_names = {
+            f"pkpbeacon-{snapshot.version}.sql",
+            f"pkpbeacon-{snapshot.version}.sql.gz",
+        }
+        return (
+            metadata["dump_date"] == snapshot.version
+            and metadata["dump_datetime"] == snapshot.completed_at.isoformat(sep=" ")
+            and metadata["uncompressed_size"] == snapshot.size
+            and recorded.get("source_filename") in source_names
+            and all(recorded.get(key) == value for key, value in expected_source.items())
+        )
+    except (OSError, UnicodeError, ValueError, TypeError, KeyError):
+        return False
 
 
 def discover_clean_exports(
@@ -2657,7 +2726,7 @@ def acquire_snapshot(args: argparse.Namespace) -> Snapshot:
         if args.force_download:
             command.append("--force")
         print("[download] checking PKP Beacon")
-        result = subprocess.run(command)
+        result = subprocess.run(command, **source_activity_child_options(args.raw_dir))
         if result.returncode != 0:
             raise PipelineError("Beacon download stage failed")
     if not latest.exists():
@@ -2701,6 +2770,7 @@ def snapshots_to_process(
             item.version
             for item in discover_snapshots(raw_dir, through=latest_export_version)
             if item.version not in exported_versions
+            and not retained_snapshot_matches_release(item, clean_dir)
         ]
         if late_backfills:
             raise PipelineError(
@@ -2918,7 +2988,7 @@ def _main(argv: list[str] | None = None) -> int:
     release_thresholds = ReleaseThresholds(*threshold_values)
 
     try:
-        with pipeline_lock(args.clean_dir):
+        with source_activity(args.raw_dir), pipeline_lock(args.clean_dir):
             target = acquire_snapshot(args)
             print(
                 f"[snapshot] target {target.path.name}; "
@@ -3017,7 +3087,11 @@ def _main(argv: list[str] | None = None) -> int:
                 f"{latest_counts.merged_articles} merged; "
                 f"{latest_counts.events} events in target snapshot"
             )
-    except (OSError, PipelineError, subprocess.SubprocessError) as exc:
+    except SourceActivityBusy:
+        print(json.dumps({"status": "skipped", "reason": "source_activity_busy",
+                          "message": "Download or wrangling already in progress; no new download started."}))
+        return 0
+    except (OSError, PipelineError, SourceActivityError, subprocess.SubprocessError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     except PipelineInterrupted as exc:

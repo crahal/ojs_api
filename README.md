@@ -4,6 +4,9 @@ PKP Beacon bibliometric processing and a read-only REST/OAI-PMH API, configured
 for a small 4 GB AWS Lightsail instance. It checks Beacon daily and can spend
 several days processing a new dump with one worker.
 
+The production HTTPS origin is `https://13.135.237.76`. Caddy manages a publicly
+trusted certificate for the static IP; no custom domain is required.
+
 Start with [LIGHTSAIL_DEPLOYMENT.md](LIGHTSAIL_DEPLOYMENT.md) for the deployment
 steps and current cost assumptions. The starting estimate is about USD
 49.60/month for a 4 GB instance and 256 GB data disk; peak full-data storage has
@@ -16,7 +19,24 @@ documents callers, and [HOW_TO_DEPLOY.md](HOW_TO_DEPLOY.md) covers operations.
 The source is `https://beacon.publicknowledgeproject.org/mysql/pkpbeacon.gz`.
 A private, ignored `.secrets/beacon.ini` supplies Basic authentication; never
 commit the password. The checked-in cron calls the bounded systemd service at
-03:17 UTC. There is one job at a time, including when a build lasts several days.
+03:17 UTC with the server timezone set to UTC: 04:17 London time in summer and
+03:17 in winter. There is one job at a time, including when a build lasts several
+days. The coordinator allows 30 days (`OJS_MAX_RUNTIME_HOURS=720`), bounded by a
+31-day systemd timeout. Applying a new deadline to an active process requires
+a controlled restart; only metadata checkpoints resume, while interrupted
+finalization rebuilds the candidate. See [recovery](HOW_TO_DEPLOY.md#failed-download-or-build).
+
+Downloads and processing share `data/raw/.source-activity.lock`. The coordinator,
+direct pipeline, Beacon downloader and HTML scraper all use it, so processes
+using the same raw-data directory cannot download or process concurrently.
+An occupied lock makes a new command return `source_activity_busy` with exit
+status 0; it does not queue work or cache a new download. Cron leaves the active
+service running and retries on its next daily check. Beacon's read-only `--check`
+(`make check-source`) can still issue HEAD requests, without GET downloads or
+file changes. Never delete the lock file; the operating system releases the
+lock when its holders exit. This advisory lock covers repository entry points;
+manual `curl`, `rsync` and filesystem writes do not participate, so do not add
+raw inputs manually during a build. See [lock verification and deployment requirements](LIGHTSAIL_DEPLOYMENT.md#8-install-the-daily-cron).
 
 1. Check HTTP validators. Unchanged data needs no download or processing.
 2. Download one resumable gzip and validate its CRC, SQL footer and checksums.

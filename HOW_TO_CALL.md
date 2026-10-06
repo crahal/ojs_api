@@ -31,8 +31,12 @@ install -m 600 api-client.env "$HOME/.config/ojs-api-client.env"
 set -a
 . "$HOME/.config/ojs-api-client.env"
 set +a
-export OJS_BASE_URL=https://api.example.org
+export OJS_BASE_URL=https://13.135.237.76
 ```
+
+The production API uses this static IP address with a publicly trusted HTTPS
+certificate; no custom domain is required. For another deployment, substitute
+the HTTPS origin supplied by its operator. Keep certificate verification enabled.
 
 The key is used as the HTTP Basic password. Use it only over HTTPS:
 

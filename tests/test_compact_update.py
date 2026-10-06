@@ -104,7 +104,7 @@ class FakeRunner:
         path = Path(env["OJS_LIVE_DATA_DIR"])
         assert path.is_absolute() and path.name.startswith("mysql-20") and not path.is_symlink()
 
-    def child(self, command, *, cwd, env, reserve_check, timeout):
+    def child(self, command, *, cwd, env, reserve_check, timeout, pass_fds=()):
         reserve_check()
         self.children.append(command)
         if self.on_child:
@@ -197,7 +197,7 @@ class CompactUpdateTests(unittest.TestCase):
 
         self.runner.on_child = blocked_child
         self.coordinator.env["MYSQL_ROOT_PASSWORD"] = "private-password"
-        with contextlib.redirect_stderr(output), \
+        with update.source_activity(self.raw), contextlib.redirect_stderr(output), \
              mock.patch.object(update, "Progress", side_effect=lambda label, **kwargs:
                                progress(label, interval=0.01, **kwargs)):
             self.coordinator.child(["private-command", "https://private-host"], stage="update-build")
