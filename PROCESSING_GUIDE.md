@@ -59,6 +59,12 @@ normally synchronize.
    source forgot to update its timestamp. Parsing uses indexed ID ranges with
    one worker on the small host; large XML and metadata tables use MySQL
    compression, and temporary work can spill to disk.
+   In compact mode, the metadata staging table keeps identity, matching keys,
+   hashes and the small fields needed to select the canonical source. It does
+   not store another copy of the full XML and 13 payload-only text fields for
+   every source. Those values are read from the original imported record only
+   when its canonical payload is needed. This changes temporary storage, not
+   matching rules or the fields ultimately returned by the API.
 
 7. **Merge exact duplicates.** Matching is deterministic and exact—there is no
    fuzzy score:
@@ -86,6 +92,14 @@ normally synchronize.
    are preferred, followed by richer metadata, then the lowest source ID as a
    deterministic tie-breaker. All aliases remain in `ojs_article_sources` so
    the chosen value can be traced back to its origin.
+   Compact mode releases matching work tables after their final use. Once all
+   required canonical payloads have been materialized, it saves the exact total
+   raw-row count with the snapshot date and source hash, then empties the
+   imported `records` table before creating the next article-state copy. The
+   compressed source file is retained. Reports use the bound, saved count, so
+   excluded source rows are still counted accurately. This point is already in
+   the non-resumable finalization phase; metadata resume is forbidden if the
+   raw-reclamation audit exists, including after an interrupted cleanup.
 
 9. **Apply lifecycle rules.** A new article is `added`; changed content or
    provenance is `modified`; a returned article is `restored`. A missing or
@@ -102,6 +116,9 @@ normally synchronize.
     the database contains only the clean serving state. The coordinator briefly
     stops MySQL/API, switches the serving directory, restarts and checks the
     authenticated API. Failed checks restore the previous release.
+    The report also records the storage profile and a SHA-256 of the rendered
+    SQL phases, alongside the unchanged source SQL checksum. This distinguishes
+    compact storage implementations without rewriting their semantic inputs.
 
 11. **Remove obsolete large artifacts.** Only after the new release works,
     remove older managed raw gzips, exports and unmounted databases. Keep the

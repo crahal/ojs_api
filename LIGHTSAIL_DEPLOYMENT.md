@@ -371,6 +371,36 @@ The disk reserve monitor stops work if free space falls below 8 GiB. The
 Use the measured peak to decide capacity; do not disable the reserve to force
 a build. A memory-limit failure is reported and the old release remains live.
 
+### Compact-storage upgrade and checkpoint recovery
+
+The `deferred-source-payload-v1` profile avoids persisting full XML and 13
+payload-only text columns for every source alias. It releases matching work
+tables after their last use, and reclaims imported record storage after the
+canonical payloads exist. Before reclaiming it, the job saves the exact raw-row
+count, snapshot date and source hash; permanent reports retain the correct raw
+and excluded-row counts. Immutable source archives are not removed by this
+optimization. The report records the profile, rendered SQL digest and count of
+reclaimed imported rows separately from bibliometric removals.
+
+This profile reduces measured bootstrap waste; the final peak still needs a
+complete full-data run. Do not disable the disk reserve or delete `.ibd` files.
+
+An already running worker has its old SQL loaded in memory. Applying this
+upgrade requires a controlled stop and restart. If its checkpoint says
+`metadata_ready` and its original SQL/source hashes still match, normal resume
+retains the imported records and source index, verifies the source checksum,
+truncates only the generated metadata staging table, and repeats metadata
+extraction. Completed metadata ranges are not retained. Source SQL and its
+checksum are unchanged by this storage-only renderer; never edit a checkpoint
+to bypass a mismatch. A `finalizing` checkpoint requires a fresh candidate
+build, and reclamation audit evidence also forbids metadata-only resume.
+
+Before restarting, record the checkpoint phase and free space, obtain approval
+for repeated work, and verify clean MySQL shutdown. Confirm `[resume]` and
+`[storage] profile=deferred-source-payload-v1` in the new run. Import/index file
+identities should remain unchanged; do not mistake checksum verification for
+a second import. Leave the cron/source lock in place so downloads stay excluded.
+
 ## 7. Smoke-test the API and configure HTTPS
 
 ```bash

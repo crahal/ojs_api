@@ -14,6 +14,12 @@ not yet been benchmarked. [PROCESSING_GUIDE.md](PROCESSING_GUIDE.md) explains
 the data transformations in simple terms. [HOW_TO_CALL.md](HOW_TO_CALL.md)
 documents callers, and [HOW_TO_DEPLOY.md](HOW_TO_DEPLOY.md) covers operations.
 
+Compact builds defer full XML and payload-only text until canonical selection,
+avoiding a large duplicate payload for every source in metadata staging. The
+storage profile is logged and included in release reports. This reduces an
+observed bootstrap bottleneck; it is not a guarantee that the complete dataset
+fits a particular disk size. Keep the disk reserve enabled throughout the build.
+
 ## Daily workflow
 
 The source is `https://beacon.publicknowledgeproject.org/mysql/pkpbeacon.gz`.

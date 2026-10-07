@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import BinaryIO, Callable
 
 from download_beacon import read_validated_metadata, validate_cached_snapshot
+from compact_storage import COMPACT_STORAGE_PROFILE, CompactStorageError, render_compact_sql
 from progress_logging import Progress, progress_interval
 from source_activity import (
     SourceActivityBusy, SourceActivityError, source_activity,
@@ -70,6 +71,7 @@ SQL_PROGRESS_STAGES = frozenset({
     "effective_keys", "noisy_keys", "touched_keys", "existing_candidates",
     "initial_assignments", "deduplication", "article_merges",
     "source_reconciliation", "source_indexes", "key_reconciliation",
+    "raw_storage_release",
     "article_rollup", "canonical_payload", "article_state", "article_events",
     "article_updates", "snapshot_counts", "stage_cleanup", "sql_complete",
 })
@@ -516,6 +518,11 @@ def sha256_small_file(path: Path, progress_seconds: float | None = None) -> str:
 
 def split_build_sql(path: Path, compact_storage: bool = False) -> BuildSQLParts:
     sql = path.read_text(encoding="utf-8")
+    if compact_storage:
+        try:
+            sql = render_compact_sql(sql)
+        except CompactStorageError as exc:
+            raise PipelineError(str(exc)) from exc
     sql = sql.replace(
         "/* OJS_COMPACT_TABLE */",
         "ROW_FORMAT=COMPRESSED KEY_BLOCK_SIZE=8" if compact_storage else "",
@@ -1391,8 +1398,26 @@ def collect_change_report(
     source_sha256: str,
     build_sql_sha256: str,
     counts: BuildCounts,
+    compact_storage: bool = False,
 ) -> dict[str, object]:
     """Build a deterministic, release-level audit summary from committed rows."""
+    raw_count_expression = "(SELECT COUNT(*) FROM records)"
+    if compact_storage:
+        # Compact finalization releases imported XML only after all canonical
+        # payloads exist. Preserve the exact ALL-source count, not an estimate
+        # or the ISSN-filtered source-index count, in the permanent report.
+        audit = server.execute(
+            "SELECT DATE_FORMAT(snapshot_date, '%Y-%m-%d'), source_sha256, "
+            "raw_source_rows, reclaimed, "
+            "EXISTS(SELECT 1 FROM records LIMIT 1) "
+            "FROM ojs_pipeline_raw_stats WHERE id = 1;",
+            database=database, password=password, label="change-report-raw-storage-audit",
+        ).split("\t")
+        if (len(audit) != 5 or audit[0] != snapshot.version
+                or audit[1] != source_sha256 or not re.fullmatch(r"[0-9]+", audit[2])
+                or audit[3:] != ["1", "0"]):
+            raise PipelineError("compact raw storage audit is missing or does not match this snapshot")
+        raw_count_expression = str(int(audit[2]))
     previous_output = server.execute(
         f"""
         SELECT
@@ -1442,7 +1467,7 @@ def collect_change_report(
                 ),
                 '-'
             ),
-            (SELECT COUNT(*) FROM records),
+            {raw_count_expression},
             COUNT(*),
             COALESCE(SUM(is_present = 1), 0),
             COALESCE(SUM(is_active = 1), 0),
@@ -1582,6 +1607,8 @@ def collect_change_report(
         raise PipelineError(
             "change-report source counts do not match validated snapshot"
         )
+    if raw_source_rows < source_present:
+        raise PipelineError("reported raw row count is smaller than present in-scope sources")
     previous_date = None if fields[0] == "-" else fields[0]
     if previous_counts is not None and previous_counts["date"] != previous_date:
         raise PipelineError(
@@ -2186,6 +2213,12 @@ def validate_resume_state(
     password: str | None,
     build_sql_sha256: str,
 ) -> str | None:
+    if server.execute(
+        "SELECT EXISTS(SELECT 1 FROM information_schema.tables "
+        "WHERE table_schema = DATABASE() AND table_name = 'ojs_pipeline_raw_stats');",
+        database=database, password=password, label="resume-raw-storage-check",
+    ) != "0":
+        raise PipelineError("imported raw storage has entered finalization; metadata resume is unsafe")
     state = read_build_state(staging_dir)
     if state is not None:
         expected = {
@@ -2462,6 +2495,9 @@ def build_snapshot_database(
     counts: BuildCounts | None = None
     try:
         build_parts = split_build_sql(build_sql, compact_storage)
+        if compact_storage:
+            print(f"[storage] profile={COMPACT_STORAGE_PROFILE}; "
+                  "full source payloads are deferred until canonical selection", flush=True)
         prelude_factory: Callable[[], str] = lambda: build_sql_prelude(
             snapshot=snapshot,
             source_sha256=source_sha256,
@@ -2499,6 +2535,8 @@ def build_snapshot_database(
                 database=database,
                 password=active_password,
             )
+            print("[resume] discarded only generated metadata staging rows; "
+                  "imported records and source index retained", flush=True)
             (staging_dir / "PIPELINE_FAILED.txt").unlink(missing_ok=True)
         else:
             server.initialize()
@@ -2587,7 +2625,17 @@ def build_snapshot_database(
             source_sha256=source_sha256,
             build_sql_sha256=build_sql_sha256,
             counts=counts,
+            compact_storage=compact_storage,
         )
+        report["storage"] = {
+            "profile": COMPACT_STORAGE_PROFILE if compact_storage else "standard",
+            "rendered_build_sql_sha256": hashlib.sha256(
+                (build_parts.prefix + build_parts.metadata + build_parts.suffix).encode("utf-8")
+            ).hexdigest(),
+            "raw_table_rows_reclaimed": (
+                report["source_rows"]["raw_in_snapshot"] if compact_storage else 0
+            ),
+        }
         anomalies = release_anomalies(report, release_thresholds)
         guard_status = (
             "overridden"
