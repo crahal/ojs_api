@@ -470,8 +470,14 @@ Any minimum funding requirement for the API account is separate from this usage
 estimate.
 
 Each request has at most 8 KiB of input and 512 output tokens, with one attempt
-and no automatic retries. The reporter allows at most two attempts per UTC day
-and 65 per UTC month. Failed requests, paid previews and forced checks count
+and no automatic retries. The reporter allows at most ten attempts per UTC day
+and 65 per UTC month. The email schedule remains every 12 hours; the additional
+daily allowance is for manual previews and troubleshooting, not extra emails.
+At the current fixed model's pricing and request bounds, even ten requests are
+expected to cost far below the approved USD 0.50/day ceiling. This is a
+conservative request-count limit, not an account-wide dollar limit or a spending
+target; review it if prices, models or token bounds change.
+Failed requests, paid previews and forced checks count
 toward these limits; `--force` does not bypass the AI allowance. The bounded
 `/var/lib/ojs-api-report/llm-budget.json` usage record is local to this reporter
 and does not limit other API clients.
@@ -519,11 +525,14 @@ inspect API access or the local attempt limit before retrying the preview; the
 key helper refuses repeat installation. After a software fix, rerun from the
 `sudo bash .../preview_progress_ai.sh` line onward, not the key-creation line.
 The preview reports a fixed, non-sensitive validation category (unsupported
-response format, incomplete response, text length/style, or disallowed content)
-without printing a rejected response. Do not remove the usage record to bypass
-the attempt limit; wait for the next UTC day if both attempts were used.
-Keep the key file while the drop-in is
-installed: a missing file makes systemd reject service startup before the
+response format, incomplete response, text length/style, or disallowed content).
+Content failures also list all triggered rule IDs, such as `status_complete` or
+`word_eta`, from a fixed vocabulary—not matched text, numbers or URLs. No rejected
+response is printed or saved. Do not remove the usage record to bypass the
+attempt limit; wait for the next UTC day if all ten attempts were used, or the
+next UTC month if its allowance was exhausted.
+Keep the key file while the drop-in is installed: a missing file makes systemd
+reject service startup before the
 reporter's factual fallback can run.
 
 To return to factual Gmail reports, remove only this optional drop-in and reload
