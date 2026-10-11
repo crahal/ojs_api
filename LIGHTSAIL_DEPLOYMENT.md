@@ -482,6 +482,13 @@ invocation IDs. Requests set `store=false`; this does not guarantee zero
 retention under OpenAI's [data controls](https://developers.openai.com/api/docs/guides/your-data).
 The existing `--dry-run` remains offline and needs no API credential.
 
+Validation reads only the final assistant text and ignores optional
+[Responses reasoning metadata](https://developers.openai.com/api/docs/guides/reasoning).
+Ordinary whitespace is normalized. Explicit uncertainty (for example, “this
+does not mean recovery is complete”) is allowed; positive completion claims,
+numbers, commands and links still trigger the factual fallback. These checks
+are conservative language checks, not proof that an interpretation is correct.
+
 In an interactive Lightsail terminal, enter an OpenAI API key at the helper's
 hidden prompt. Never put the key in chat, command arguments, environment
 variables or Git. The helper writes root-owned, mode-600
@@ -509,7 +516,13 @@ on its next report; there is no need to trigger an extra email.
 
 If the preview fails after the key was saved, leave the drop-in uninstalled and
 inspect API access or the local attempt limit before retrying the preview; the
-key helper refuses repeat installation. Keep the key file while the drop-in is
+key helper refuses repeat installation. After a software fix, rerun from the
+`sudo bash .../preview_progress_ai.sh` line onward, not the key-creation line.
+The preview reports a fixed, non-sensitive validation category (unsupported
+response format, incomplete response, text length/style, or disallowed content)
+without printing a rejected response. Do not remove the usage record to bypass
+the attempt limit; wait for the next UTC day if both attempts were used.
+Keep the key file while the drop-in is
 installed: a missing file makes systemd reject service startup before the
 reporter's factual fallback can run.
 

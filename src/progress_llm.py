@@ -42,7 +42,8 @@ INSTRUCTIONS = (
     "Stale observations do not establish the current stage. State uncertainty when evidence "
     "is stale, missing, or not comparable. Only discuss counter changes when the supplied "
     "comparison explicitly establishes the same invocation and stage. "
-    "Leave exact counters to the separate factual report. Do not use Markdown."
+    "Leave exact counters to the separate factual report. Do not use Markdown. "
+    "For uncertainty, prefer: Overall recovery and API availability remain unverified."
 )
 _KEY = re.compile(r"sk-[A-Za-z0-9_-]{16,509}\Z")
 _BUDGET_KEYS = frozenset({"schema", "day", "month", "day_attempts", "month_attempts", "last_attempt_at"})
@@ -56,15 +57,35 @@ ERROR_MESSAGES = {
     "monthly_limit": "Monthly AI attempt limit reached; use the factual report.",
     "invalid_key": "OpenAI API key file is missing or invalid; use the factual report.",
     "rejected_output": "AI interpretation did not pass validation; use the factual report.",
+    "output_format": "AI response format was unsupported; use the factual report.",
+    "output_incomplete": "AI response was incomplete; use the factual report.",
+    "output_style": "AI response exceeded the short plain-text format; use the factual report.",
+    "output_content": "AI response contained disallowed content or an unverified claim; use the factual report.",
 }
 _UNSUITABLE = re.compile(
     r"https?\b|www\.|://|@|\b[a-z][a-z.-]*\.(?:com|org|net|io|edu|gov|uk|dev)\b"
+    r"|\bdrop\s+(?:(?:the|a|this|that|your|all|if|exists)\s+){0,3}"
+    r"(?:databases?|tables?|indexes?|schemas?|users?|roles?|jobs?|processes?|services?|files?|directories|data|archives?)\b"
     r"|\b(?:sudo|systemctl|mysqladmin|mysqld|curl|wget|kill|restart|reboot|delete|"
-    r"drop|truncate|chmod|chown|ssh|rm|eta|percent|percentage|tomorrow|tonight|"
+    r"truncate|chmod|chown|ssh|rm|eta|percent|percentage|tomorrow|tonight|"
     r"hour|hours|minute|minutes|day|days|week|weeks|zero|one|two|three|four|five|"
-    r"six|seven|eight|nine|ten|hundred|thousand|million|billion|trillion|"
-    r"healthy|normal|normally|succeeded|successful|successfully|done|finished|complete|completed)\b",
+    r"six|seven|eight|nine|ten|hundred|thousand|million|billion|trillion)\b",
     re.IGNORECASE,
+)
+_STATUS_WORDS = r"healthy|normal|normally|succeeded|successful|successfully|done|finished|complete|completed"
+_STATUS_CLAIM = re.compile(rf"\b(?:{_STATUS_WORDS})\b", re.IGNORECASE)
+# These are deliberately narrow language checks, not a semantic verifier.
+# A cautious denial such as 'does not mean recovery is complete' is not a
+# positive completion claim. Never let its scope cross a sentence or contrast.
+_NEGATED_STATUS = re.compile(rf"\bnot\s+(?:yet\s+)?(?:{_STATUS_WORDS})\b", re.IGNORECASE)
+_UNCERTAIN_STATUS = re.compile(
+    r"\b(?:(?:does not|do not|cannot|can['’]t|doesn['’]t|don['’]t)\s+(?:yet\s+)?"
+    r"(?:mean|prove|show|establish|verify|confirm|demonstrate|indicate|guarantee)"
+    r"|(?:no|without)\s+(?:evidence|confirmation|proof|verification)"
+    r"|(?:unclear|unknown|unverified)\s+(?:whether|if))\b"
+    rf"(?:(?!\b(?:but|however|although|nevertheless|yet|while|and|or|so|therefore|thus|hence|instead|otherwise)\b)"
+    rf"[^.!?;:,—–]){{0,160}}?"
+    rf"\b(?:{_STATUS_WORDS})\b", re.IGNORECASE,
 )
 
 
@@ -272,35 +293,51 @@ def _bounded_request(payload: bytes, key: str) -> bytes:
 
 
 def _summary(encoded: bytes) -> str:
-    response = json.loads(encoded.decode("utf-8"))
+    try:
+        response = json.loads(encoded.decode("utf-8"))
+    except (ValueError, UnicodeError, RecursionError):
+        raise SummaryUnavailable("output_format") from None
     if (not isinstance(response, dict) or response.get("status") != "completed"
             or response.get("error") is not None or response.get("incomplete_details") is not None):
-        raise SummaryUnavailable()
+        raise SummaryUnavailable("output_incomplete")
     output = response.get("output")
     if not isinstance(output, list) or not 1 <= len(output) <= 4:
-        raise SummaryUnavailable()
+        raise SummaryUnavailable("output_format")
     fragments = []
     for item in output:
+        # Reasoning metadata can accompany the final assistant text even in
+        # stateless responses. Never display, log, store or use that metadata.
+        if isinstance(item, dict) and item.get("type") == "reasoning":
+            continue
         if (not isinstance(item, dict) or item.get("type") != "message"
                 or item.get("status") != "completed" or item.get("role") != "assistant"):
-            raise SummaryUnavailable()
+            raise SummaryUnavailable("output_format")
         content = item.get("content")
         if not isinstance(content, list) or not 1 <= len(content) <= 4:
-            raise SummaryUnavailable()
+            raise SummaryUnavailable("output_format")
         for part in content:
             if (not isinstance(part, dict) or part.get("type") != "output_text"
                     or not isinstance(part.get("text"), str) or part.get("annotations")):
-                raise SummaryUnavailable()
+                raise SummaryUnavailable("output_format")
             fragments.append(part["text"])
     text = " ".join(fragments)
-    if (not text or len(text) > 1200 or len(text.split()) > 120
-            or any(unicodedata.category(character).startswith("C") or character.isnumeric() for character in text)
-            or any(character in text for character in "`<>[]{}#%") or _UNSUITABLE.search(text)):
-        raise SummaryUnavailable()
-    text = text.strip()
+    if not text or len(text) > 4096:
+        raise SummaryUnavailable("output_style")
+    if any(unicodedata.category(character).startswith("C") and character not in "\t\r\n"
+           for character in text):
+        raise SummaryUnavailable("output_content")
+    # Ordinary line breaks/tabs/spaces are formatting, not unsafe output.
+    text = " ".join(text.split())
+    if not text or len(text) > 1200 or len(text.split()) > 120:
+        raise SummaryUnavailable("output_style")
+    claims = _NEGATED_STATUS.sub("", _UNCERTAIN_STATUS.sub("", text))
+    if (any(character.isnumeric() for character in text)
+            or any(character in text for character in "`<>[]{}#%*")
+            or _UNSUITABLE.search(text) or _STATUS_CLAIM.search(claims)):
+        raise SummaryUnavailable("output_content")
     sentences = re.findall(r"[.!?]+(?:\s+|$)", text)
     if not 2 <= len(sentences) <= 4 or not text.endswith((".", "!", "?")):
-        raise SummaryUnavailable()
+        raise SummaryUnavailable("output_style")
     return text
 
 
@@ -325,6 +362,8 @@ def generate_summary(evidence: dict, *, credential_path: Path, budget_path: Path
             raise SummaryUnavailable("network_or_api") from None
         try:
             return _summary(encoded)
+        except SummaryUnavailable:
+            raise
         except Exception:
             raise SummaryUnavailable("rejected_output") from None
     except SummaryUnavailable:

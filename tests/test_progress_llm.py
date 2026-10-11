@@ -99,6 +99,15 @@ class BudgetTests(unittest.TestCase):
         budget = json.loads(self.budget.read_text())
         self.assertEqual((budget["day_attempts"], budget["month_attempts"]), (2, 2))
 
+    def test_output_failure_keeps_specific_safe_reason_without_retry(self):
+        with mock.patch.object(llm, "_bounded_request", return_value=response(status="incomplete")) as network:
+            with self.assertRaises(llm.SummaryUnavailable) as raised:
+                self.generate()
+        self.assertEqual(raised.exception.reason, "output_incomplete")
+        self.assertSafe(raised.exception)
+        network.assert_called_once()
+        self.assertEqual(json.loads(self.budget.read_text())["day_attempts"], 1)
+
     def test_daily_rollover_keeps_monthly_count(self):
         with mock.patch.object(llm, "_bounded_request", return_value=response()):
             self.generate()
@@ -310,13 +319,75 @@ class OutputTests(unittest.TestCase):
     def test_short_plain_completed_summary_is_accepted(self):
         self.assertEqual(llm._summary(response()), TEXT)
 
+    def test_benign_whitespace_is_normalized_not_rejected(self):
+        for text in (" \n" + TEXT + "\r\n", TEXT.replace(". A", ".\n\nA"),
+                     TEXT.replace(" ", "\t"), TEXT.replace(" ", "\u00a0")):
+            with self.subTest(text=text):
+                self.assertEqual(llm._summary(response(text)), TEXT)
+
+    def test_reasoning_metadata_is_ignored_but_final_text_is_required(self):
+        final = json.loads(response())["output"][0]
+        metadata = {"type": "reasoning", "id": "rs_test", "summary": [],
+                    "encrypted_content": SECRET}
+        self.assertEqual(llm._summary(response(output=[metadata, final])), TEXT)
+        self.assertEqual(llm._summary(response(output=[final, metadata])), TEXT)
+        with self.assertRaises(llm.SummaryUnavailable):
+            llm._summary(response(output=[metadata]))
+
+    def test_explicit_completion_uncertainty_is_not_a_positive_claim(self):
+        for text in (
+            "Rollback is still in progress. This does not mean recovery is complete.",
+            "The service is running. There is no evidence that recovery has finished.",
+            "The monitor is active. We cannot yet confirm that the system is healthy.",
+            "Rollback remains active. Recovery is not yet complete.",
+            "Rollback remains active. It is unclear whether recovery has succeeded.",
+            "The monitor is active. It doesn’t show that recovery has completed.",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(llm._summary(response(text)), text)
+
+    def test_drop_in_work_is_prose_not_a_database_command(self):
+        text = "The comparable counters show a drop in remaining work. Overall recovery remains unverified."
+        self.assertEqual(llm._summary(response(text)), text)
+        for command in ("Drop the table", "DROP TABLE records", "Drop this database", "Drop all data"):
+            with self.subTest(command=command), self.assertRaises(llm.SummaryUnavailable):
+                llm._summary(response(command + ". The monitor is active."))
+
+    def test_negation_cannot_hide_another_positive_claim_or_unsafe_content(self):
+        for text in (
+            "There is no evidence of an error. Recovery is complete.",
+            "Recovery is not only complete. The system is healthy.",
+            "This does not mean recovery is complete, but the system is healthy. Work is advancing.",
+            "We cannot confirm recovery is complete; the system is healthy. Work is advancing.",
+            "Recovery is not complete and the system is healthy. Work is advancing.",
+            "There is no evidence of a problem, and recovery is complete. The monitor is active.",
+            "We cannot confirm the active stage, therefore recovery is complete. The monitor is active.",
+            "We cannot confirm the active stage—recovery is complete. The monitor is active.",
+            "We cannot confirm recovery is complete. Restart the service.",
+            "We cannot confirm recovery is complete. There are 100 rows remaining.",
+        ):
+            with self.subTest(text=text), self.assertRaises(llm.SummaryUnavailable):
+                llm._summary(response(text))
+
+    def test_validation_reasons_are_safe_and_specific(self):
+        cases = [(b"not JSON " + SECRET.encode(), "output_format"),
+                 (response(status="incomplete"), "output_incomplete"),
+                 (response(output=[{"type": "function_call", "arguments": SECRET}]), "output_format"),
+                 (response("Only a sentence."), "output_style"),
+                 (response("There are 100 rows. Recovery is active."), "output_content")]
+        for encoded, reason in cases:
+            with self.subTest(reason=reason):
+                with self.assertRaises(llm.SummaryUnavailable) as raised:
+                    llm._summary(encoded)
+                self.assertEqual(raised.exception.reason, reason)
+                self.assertNotIn(SECRET, str(raised.exception))
+
     def test_numbers_urls_controls_commands_and_completion_claims_are_rejected(self):
         texts = ["There are 100 rows left. Progress looks promising.",
                  "There are １００ rows left. Progress looks promising.",
                  "This will take two hours. The monitor is alive.",
                  "See https://example.com. The monitor is alive.",
                  "See example.com for help. The monitor is alive.",
-                 "The monitor is alive.\nThe stage is pending.",
                  "The monitor is alive.\x00The stage is pending.",
                  "The monitor is alive.\u200bThe stage is pending.",
                  "Restart the service. The monitor is alive.",
