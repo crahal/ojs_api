@@ -127,6 +127,9 @@ class EmailDeploymentTest(unittest.TestCase):
         self.assertIn("--wait", arguments)
         self.assertIn("--pipe", arguments)
         self.assertNotIn("--force", arguments)
+        # A previous failed preview must not block a retry through a fixed
+        # transient unit name; the Python reporter owns the shared flock.
+        self.assertFalse(any(arg == "--unit" or arg.startswith("--unit=") for arg in arguments))
 
     def test_documented_openai_activation_requires_a_successful_paid_preview(self):
         guide = (PROJECT_ROOT / "LIGHTSAIL_DEPLOYMENT.md").read_text()

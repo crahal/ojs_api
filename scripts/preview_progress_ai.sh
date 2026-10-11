@@ -5,7 +5,9 @@ if [[ ${EUID} -ne 0 ]]; then
     echo 'Run this preview with sudo.' >&2
     exit 1
 fi
-exec systemd-run --quiet --unit=ojs-api-progress-ai-preview --collect --wait --pipe \
+# Let systemd allocate a fresh transient unit name. A failed preview's unit can
+# remain loaded despite --collect; the report flock still prevents overlap.
+exec systemd-run --quiet --collect --wait --pipe \
     --property=Type=oneshot \
     --property=User=ojs --property=Group=ojs \
     --property=SupplementaryGroups=systemd-journal \
