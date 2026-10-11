@@ -372,6 +372,86 @@ The disk reserve monitor stops work if free space falls below 8 GiB. The
 Use the measured peak to decide capacity; do not disable the reserve to force
 a build. A memory-limit failure is reported and the old release remains live.
 
+### Optional Gmail progress reports every 12 hours
+
+The independent `ojs-api-progress-email` service sends a bounded, read-only
+summary of recovery progress from Lightsail, including available service,
+checkpoint and resource observations. It does not connect to MySQL, modify the
+recovery, or email raw logs or database contents. Missing or stale observations
+are reported as such; a heartbeat is not proof of successful recovery or a live
+API. `--dry-run` prints the report without credentials, sending mail, or writing
+reporter state, so it can be checked during recovery:
+
+```bash
+sudo -u ojs -g systemd-journal python3 -B /srv/ojs_api/src/email_progress.py --dry-run
+```
+
+The sender needs Google 2-Step Verification and a dedicated
+[Gmail app password](https://support.google.com/accounts/answer/185833?hl=en).
+Some accounts do not offer app passwords. An existing Gmail connection in chat
+does not give the Lightsail host permission to send email. Create the credential
+privately and enter it only at the helper's hidden prompt in an interactive SSH
+terminal; never put it in chat, command arguments, environment variables or Git.
+
+Install the units, then configure the sender and recipient, substituting actual
+addresses for `YOUR_GMAIL` and `YOUR_EMAIL`:
+
+```bash
+cd /srv/ojs_api
+sudo install -o root -g root -m 644 deploy/ojs-api-progress-email.service /etc/systemd/system/ojs-api-progress-email.service
+sudo install -o root -g root -m 644 deploy/ojs-api-progress-email.timer /etc/systemd/system/ojs-api-progress-email.timer
+sudo systemctl daemon-reload
+sudo python3 /srv/ojs_api/scripts/configure_progress_email.py \
+    --sender YOUR_GMAIL --recipient YOUR_EMAIL &&
+sudo systemctl start ojs-api-progress-email.service &&
+sudo systemctl enable --now ojs-api-progress-email.timer
+```
+
+The helper requires a terminal and refuses to overwrite existing configuration.
+It writes root-owned, mode-600 `/etc/ojs-api/progress-email.env` containing only
+the non-secret `OJS_PROGRESS_EMAIL_FROM` and `OJS_PROGRESS_EMAIL_TO` addresses,
+and `/etc/ojs-api/progress-email-password` containing the password. systemd
+passes the latter using `LoadCredential=gmail-app-password:...`; the password
+is not supplied through the process environment. The service runs as `ojs`,
+adds `systemd-journal` access only for this service, and makes the project/data
+read-only within its sandbox. Docker sockets and the API's `.env`/`.secrets`
+are inaccessible to the service. It retains one bounded delivery-state file,
+`/var/lib/ojs-api-report/last-sent.json`, and its lock; the journal receives brief
+delivery status without report dumps or credentials.
+
+On first configuration, the chained commands enable the timer only after a
+successful manual send.
+Success means Gmail's SMTP server accepted the message; check the recipient's
+inbox/spam folder to confirm arrival. If authentication fails, leave the timer
+disabled and correct or replace the credential through a private operator
+workflow; blindly rerunning the helper cannot replace its existing files.
+
+Later starts skip sending if a successful delivery was recorded less than
+11 hours ago, preventing duplicate reports from nearby or manual triggers.
+This guard uses the delivery timestamp even when the progress stage is unknown.
+A skipped run exits successfully but does not test SMTP authentication. For a
+deliberate authentication retest, the reporter accepts `--force` through the
+private operator workflow with its protected credentials; leave this option
+off the scheduled service.
+
+`OnActiveSec=12h` schedules the first automatic report 12 hours after enabling
+the timer; `OnUnitActiveSec=12h` schedules subsequent reports from the last
+service start. A reboot begins a fresh 12-hour interval. There is no backlog
+replay or automatic retry flood. Lightsail sends independently of the laptop
+or SSH session, but an offline instance cannot send an outage notification.
+Inspect the schedule and failures without changing recovery:
+
+```bash
+sudo systemctl list-timers ojs-api-progress-email.timer --all
+sudo systemctl show ojs-api-progress-email.service -p ActiveState -p SubState -p Result -p ExecMainStatus
+sudo journalctl -u ojs-api-progress-email.service -n 20 --no-pager
+```
+
+To stop future scheduled reports, run
+`sudo systemctl disable --now ojs-api-progress-email.timer`; this does not stop
+or change recovery. Revoke the dedicated Gmail app password when reporting is
+no longer needed.
+
 ### Compact-storage upgrade and checkpoint recovery
 
 The `deferred-source-payload-hash-keys-v2` profile avoids persisting full XML and 13

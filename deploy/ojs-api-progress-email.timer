@@ -1,0 +1,14 @@
+[Unit]
+Description=Send OJS progress email every 12 hours
+
+[Timer]
+# Enable only after a successful manual service run. The first scheduled run
+# is 12 hours after activation; later runs are 12 hours after the last start.
+# After reboot the timer begins a fresh interval; it never replays a backlog.
+OnActiveSec=12h
+OnUnitActiveSec=12h
+AccuracySec=1min
+Unit=ojs-api-progress-email.service
+
+[Install]
+WantedBy=timers.target
