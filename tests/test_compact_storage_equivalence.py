@@ -67,6 +67,73 @@ def rich_xml(revised: bool = False) -> str:
     )
 
 
+def key_scenario_rows(index: int) -> list[str]:
+    """Small adversarial key histories, independent of the SQL renderer."""
+    rows = []
+
+    def add(record_id, *, doi=None, title=None, creator=None, oai=None,
+            url=None, absent=False, removed=False, changed=False):
+        if absent:
+            return
+        rows.append(fixture.record_row(
+            record_id=record_id, context_id=1, identifier=1000 + record_id,
+            metadata_xml=fixture.metadata(
+                oai_identifier=f"oai:rare:café:{record_id}" if oai is None else oai,
+                title=f"Distinct rare entity {record_id}" if title is None else title,
+                creator=f"Author {record_id}" if creator is None else creator,
+                published="2025-06-15",
+                url=(f"https://rare.example/article/view/{record_id}" if url is None else url),
+                doi=doi,
+            ),
+            modified="2026-07-01 00:00:00" if changed else "2026-01-01 00:00:00",
+            removed_at="2026-07-01 00:00:00" if removed else None,
+        ))
+
+    # The corrected value retires only after the final supplying alias changes.
+    # A separate fully retired key must not capture a new, unrelated entity.
+    add(70, doi="10.1234/alias-new" if index else "10.1234/alias-old", changed=bool(index))
+    add(71, doi="10.1234/alias-new" if index == 2 else "10.1234/alias-old", changed=index == 2)
+    add(80, doi="10.1234/corrected-new" if index else "10.1234/corrected-old", changed=bool(index))
+    if index == 2:
+        add(81, doi="10.1234/corrected-old")
+        add(72, doi="10.1234/alias-old")
+
+    # Absent and explicitly removed aliases remain available for identity
+    # matching; a new active alias restores their existing article identity.
+    add(90, doi="10.1234/absent-owner", absent=index > 0)
+    add(92, doi="10.1234/inactive-owner", removed=index > 0, changed=index > 0)
+    if index == 2:
+        add(91, doi="10.1234/absent-owner")
+        add(93, doi="10.1234/inactive-owner")
+
+    # Isolated URL and fingerprint matches exercise NULL alternatives and
+    # punctuation/case normalization. Long Unicode keys expose truncation or
+    # byte/character confusion when reconstructing deferred key values.
+    add(95, title="URL A", oai="", url="HTTPS://WWW.rare.example/article/view/café/?a=1")
+    add(96, title="URL B", oai="", url="https://rare.example/article/view/café#section")
+    for record_id in (97, 98):
+        add(record_id, title="Écologie, méthode et résultats " + "é" * 2100,
+            creator="Renée Rare", oai="", url="")
+    for record_id in (99, 100):
+        add(record_id, title=f"OAI {record_id}", url="",
+            oai="OAI:Café:" + "é" * 1200 + str(record_id))
+    # The test removes this group's old lookup after January to model a
+    # retained hash whose persistent value is unavailable (as after noise).
+    # Reconstructing value text from the retained alias would change behavior.
+    add(110, doi="10.1234/lookup-corrected" if index else "10.1234/missing-lookup",
+        changed=bool(index))
+    add(111, doi="10.1234/missing-lookup")
+    if index == 2:
+        add(112, doi="10.1234/missing-lookup")
+
+    # Twenty-five retained members plus one new member cross the actual noisy
+    # fingerprint threshold without requiring a production-sized fixture.
+    for record_id in range(200, 225 + (index > 0)):
+        add(record_id, title="Repeated generic title at the exact noise boundary",
+            creator="Repeated Author", doi=f"10.1234/noisy-{record_id}")
+    return rows
+
+
 def snapshot_rows(index: int) -> list[str]:
     rows = fixture.fixture_rows(
         alpha_title="Alpha Study" if index == 0 else "Alpha Study Revised",
@@ -111,6 +178,7 @@ def snapshot_rows(index: int) -> list[str]:
         metadata_xml="<record><metadata>Excluded context</metadata></record>",
         modified="2026-01-01 00:00:00",
     ))
+    rows.extend(key_scenario_rows(index))
     return rows
 
 
@@ -124,21 +192,21 @@ def snapshot_dump(version: str, index: int) -> str:
     )
 
 
-def table_columns(server, database: str, table: str) -> list[str]:
+def table_columns(server, database: str, table: str, password=None) -> list[str]:
     return server.execute(
         "SELECT COLUMN_NAME FROM information_schema.COLUMNS "
         f"WHERE TABLE_SCHEMA='{database}' AND TABLE_NAME='{table}' "
-        "ORDER BY ORDINAL_POSITION;"
+        "ORDER BY ORDINAL_POSITION;", password=password,
     ).splitlines()
 
 
-def logical_rows(server, database: str, table: str, columns=None) -> list[str]:
+def logical_rows(server, database: str, table: str, columns=None, password=None) -> list[str]:
     """Encode every value losslessly, including binary hashes and SQL NULL."""
-    columns = columns or table_columns(server, database, table)
+    columns = columns or table_columns(server, database, table, password)
     primary_key = server.execute(
         "SELECT COLUMN_NAME FROM information_schema.STATISTICS "
         f"WHERE TABLE_SCHEMA='{database}' AND TABLE_NAME='{table}' "
-        "AND INDEX_NAME='PRIMARY' ORDER BY SEQ_IN_INDEX;"
+        "AND INDEX_NAME='PRIMARY' ORDER BY SEQ_IN_INDEX;", password=password,
     ).splitlines()
     if not columns or not primary_key:
         raise AssertionError(f"missing schema/primary key for {database}.{table}")
@@ -148,7 +216,7 @@ def logical_rows(server, database: str, table: str, columns=None) -> list[str]:
     )
     order = ",".join(f"`{column}`" for column in primary_key)
     return server.execute(
-        f"SELECT {projection} FROM `{table}` ORDER BY {order};", database=database,
+        f"SELECT {projection} FROM `{table}` ORDER BY {order};", database=database, password=password,
     ).splitlines()
 
 
@@ -234,10 +302,29 @@ class CompactStorageEquivalenceTests(unittest.TestCase):
                                     database=database,
                                 ), "0", "July must exercise unchanged-source canonical fallback")
 
+                        suffixes = {}
+                        key_boundary = "SELECT 'OJS_PROGRESS_V1', 'stage', 'noisy_keys';"
+                        for database in databases:
+                            key_sql, suffix = parts[database].suffix.split(key_boundary, 1)
+                            server.run_sql_text(
+                                key_sql, label="key materialization", database=database,
+                                password=None, prelude=prelude,
+                            )
+                            suffixes[database] = key_boundary + suffix
+                        for table in ("ojs_stage_keys", "ojs_stage_effective_keys"):
+                            standard_columns = table_columns(server, databases[0], table)
+                            compact_columns = table_columns(server, databases[1], table)
+                            self.assertIn("key_value", standard_columns)
+                            self.assertNotIn("key_value", compact_columns)
+                            self.assertEqual(
+                                logical_rows(server, databases[0], table, compact_columns),
+                                logical_rows(server, databases[1], table),
+                                f"hash-only storage changed {table} membership",
+                            )
                         reports = []
                         for database in databases:
                             server.run_sql_text(
-                                parts[database].suffix, label="finalize", database=database,
+                                suffixes[database], label="finalize", database=database,
                                 password=None, prelude=prelude,
                             )
                             counts, _ = run_pipeline.validate_database(server, database, None)
@@ -270,6 +357,48 @@ class CompactStorageEquivalenceTests(unittest.TestCase):
                                     f"compact mode changed {table} at {version}",
                                 )
                         for database in databases:
+                            self.assertEqual(server.execute(
+                                "SELECT source_record_id,article_id FROM ojs_article_sources "
+                                "WHERE source_record_id IN (70,71,72,80,81,90,91,92,93,95,96,97,98,99,100,225) "
+                                "ORDER BY source_record_id;", database=database,
+                            ).splitlines(), [
+                                "70\t70", "71\t70", *(["72\t72"] if index == 2 else []),
+                                "80\t80", *(["81\t81"] if index == 2 else []),
+                                "90\t90", *(["91\t90"] if index == 2 else []),
+                                "92\t92", *(["93\t92"] if index == 2 else []),
+                                "95\t95", "96\t95", "97\t97", "98\t97", "99\t99", "100\t99",
+                                *(["225\t225"] if index else []),
+                            ])
+                            self.assertEqual(server.execute(
+                                "SELECT article_id,status FROM ojs_articles "
+                                "WHERE article_id IN (90,92) ORDER BY article_id;",
+                                database=database,
+                            ).splitlines(), [
+                                f"90\t{'removed' if index == 1 else 'active'}",
+                                f"92\t{'removed' if index == 1 else 'active'}",
+                            ])
+                            if index:
+                                self.assertEqual(server.execute(
+                                    "SELECT COUNT(*) FROM ojs_article_keys "
+                                    "WHERE key_type='fingerprint' AND key_value LIKE 'repeated generic%';",
+                                    database=database,
+                                ), "0", "noise counts must include unchanged retained aliases")
+                                self.assertEqual(server.execute(
+                                    "SELECT article_id,date_added FROM ojs_article_keys "
+                                    "WHERE key_type='doi' AND key_value='10.1234/missing-lookup';",
+                                    database=database,
+                                ), "" if index == 1 else "110\t2026-08-01",
+                                    "retained missing key text must stay NULL until a staged alias supplies it")
+                            if index == 2:
+                                self.assertEqual(server.execute(
+                                    "SELECT key_value,article_id,date_added FROM ojs_article_keys "
+                                    "WHERE key_type='doi' AND key_value IN "
+                                    "('10.1234/alias-old','10.1234/corrected-old') ORDER BY key_value;",
+                                    database=database,
+                                ).splitlines(), [
+                                    "10.1234/alias-old\t72\t2026-01-01",
+                                    "10.1234/corrected-old\t81\t2026-08-01",
+                                ])
                             self.assertEqual(server.execute(
                                 "SELECT canonical_source_record_id FROM ojs_articles WHERE article_id=10;",
                                 database=database,
@@ -317,6 +446,12 @@ class CompactStorageEquivalenceTests(unittest.TestCase):
                         # Production consumes the audit in its report and then
                         # prunes it; only the five clean tables enter history.
                         server.execute("DROP TABLE ojs_pipeline_raw_stats;", database=databases[1])
+                        if index == 0:
+                            for database in databases:
+                                server.execute(
+                                    "DELETE FROM ojs_article_keys WHERE key_type='doi' "
+                                    "AND key_value='10.1234/missing-lookup';", database=database,
+                                )
                 self.assertEqual(set(server.execute(
                     "SELECT DISTINCT event_type FROM ojs_article_events;", database=databases[1],
                 ).splitlines()), {"added", "modified", "merged", "removed", "restored"})
@@ -428,9 +563,133 @@ class CompactStorageEquivalenceTests(unittest.TestCase):
             report = json.loads(run_pipeline.change_report_path(clean, snapshot.version).read_text())
             self.assertEqual(report["snapshot"]["source_sha256"], source_hash)
             self.assertEqual(report["snapshot"]["build_sql_sha256"], build_hash)
-            self.assertEqual(report["storage"]["profile"], "deferred-source-payload-v1")
+            self.assertEqual(report["storage"]["profile"], "deferred-source-payload-hash-keys-v2")
             self.assertEqual(report["source_rows"]["raw_in_snapshot"], len(snapshot_rows(0)))
             self.assertEqual(report["source_rows"]["excluded_outside_valid_issn_scope"], 1)
+
+    def test_exact_keys_failure_resumes_without_reimport_or_metadata_parse(self):
+        with TemporaryDirectory(prefix="ojs-key-recovery-") as directory, \
+                redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            root = Path(directory)
+            path = root / "pkpbeacon-2026-01-01.sql"
+            path.write_text(fixture.JANUARY_DUMP, encoding="utf-8")
+            snapshot = run_pipeline.inspect_snapshot(path)
+            database = "pkpbeacon_db"
+            options = dict(
+                snapshot=snapshot, build_sql=BUILD_SQL, database=database,
+                root_password="fixture-password", api_db_user="fixture_api",
+                api_db_password="fixture-api-password",
+                release_thresholds=run_pipeline.ReleaseThresholds(0.1, 0.1, 0.1, 0.1),
+                allow_anomalous_release=True, buffer_pool_size="128M", progress_seconds=60,
+                force_rebuild=False, verify_existing=False, verify_source_checksum=False,
+                full_rescan=False, publish_current=False, metadata_workers=1,
+            )
+            baseline_clean = root / "baseline"
+            baseline_dir, baseline_counts = run_pipeline.build_snapshot_database(
+                **options, clean_dir=baseline_clean, resume_building=False, compact_storage=False,
+            )
+            expected_tables = {}
+            baseline = run_pipeline.MySQLServer(
+                run_pipeline.MySQLTools.discover(), baseline_dir, "128M",
+            )
+            try:
+                baseline.start("fixture-password")
+                for table in run_pipeline.CLEAN_EXPORT_TABLES:
+                    expected_tables[table] = logical_rows(
+                        baseline, database, table, password="fixture-password",
+                    )
+            finally:
+                baseline.shutdown("fixture-password")
+
+            clean = root / "recovery"
+            staging = clean / "mysql-2026-01-01.building"
+            original_run = run_pipeline.MySQLServer.run_sql_text
+            original_start = run_pipeline.MySQLServer.start
+            preserved = ("records", "ojs_stage_source_index", "ojs_stage_sources")
+            original_rows = {}
+            # Reproduce the representation that failed in production: the old
+            # wide exact-key table, with only one UNION arm partly populated.
+            legacy_suffix = run_pipeline.split_build_sql(BUILD_SQL).suffix
+            partial_keys = legacy_suffix.split("INSERT INTO ojs_stage_keys\n", 1)[0] + """
+INSERT INTO ojs_stage_keys
+SELECT source_record_id, 'oai', oai_key_hash, oai_key_value
+FROM ojs_stage_sources
+WHERE oai_key_hash IS NOT NULL AND source_record_id <= 3;
+"""
+
+            def interrupted_run(server, sql, **kwargs):
+                if kwargs["label"] != "temporal finalization phase":
+                    return original_run(server, sql, **kwargs)
+                original_run(server, partial_keys, **kwargs)
+                self.assertEqual(server.execute(
+                    "SELECT COUNT(*) FROM ojs_stage_keys;", database=database,
+                ), "3")
+                for table in preserved:
+                    original_rows[table] = logical_rows(server, database, table)
+                raise run_pipeline.PipelineError("simulated interrupted exact_keys INSERT")
+
+            with mock.patch.object(run_pipeline.MySQLServer, "run_sql_text", new=interrupted_run), \
+                    self.assertRaisesRegex(run_pipeline.PipelineError, "simulated interrupted"):
+                run_pipeline.build_snapshot_database(
+                    **options, clean_dir=clean, resume_building=False, compact_storage=True,
+                )
+            self.assertEqual(run_pipeline.read_build_state(staging)["phase"], "finalizing")
+            staging_inode = staging.stat().st_ino
+            identities = {
+                name: (staging / database / f"{name}.ibd").stat().st_ino
+                for name in preserved
+            }
+            seen = []
+
+            def assert_preserved(server):
+                self.assertEqual(server.datadir.stat().st_ino, staging_inode)
+                for table, inode in identities.items():
+                    self.assertEqual((staging / database / f"{table}.ibd").stat().st_ino, inode)
+                    self.assertEqual(logical_rows(server, database, table), original_rows[table])
+
+            def resumed_start(server, password):
+                original_start(server, password)
+                assert_preserved(server)
+                seen.append("started existing data")
+
+            def resumed_run(server, sql, **kwargs):
+                self.assertNotIn(kwargs["label"], ("source-index phase", "metadata-shard"))
+                if kwargs["label"] == "temporal finalization phase":
+                    assert_preserved(server)
+                    seen.append("reused complete metadata")
+                return original_run(server, sql, **kwargs)
+
+            with mock.patch.object(run_pipeline.MySQLServer, "initialize", side_effect=AssertionError("must not initialize")), \
+                    mock.patch.object(run_pipeline.MySQLServer, "import_snapshot", side_effect=AssertionError("must not import")), \
+                    mock.patch.object(run_pipeline, "extract_metadata_in_parallel", side_effect=AssertionError("must not parse metadata")), \
+                    mock.patch.object(run_pipeline.MySQLServer, "start", new=resumed_start), \
+                    mock.patch.object(run_pipeline.MySQLServer, "run_sql_text", new=resumed_run):
+                final_dir, counts = run_pipeline.build_snapshot_database(
+                    **options, clean_dir=clean, resume_building=True, compact_storage=True,
+                    recover_exact_keys=True,
+                )
+            self.assertEqual(seen, ["started existing data", "reused complete metadata"])
+            self.assertEqual(final_dir.stat().st_ino, staging_inode)
+            self.assertEqual(counts, baseline_counts)
+            self.assertFalse((final_dir / run_pipeline.BUILD_STATE_NAME).exists())
+            self.assertFalse((final_dir / "PIPELINE_FAILED.txt").exists())
+            self.assertTrue(run_pipeline.release_artifacts_complete(clean, snapshot.version))
+            actual = run_pipeline.MySQLServer(
+                run_pipeline.MySQLTools.discover(), final_dir, "128M",
+            )
+            try:
+                actual.start("fixture-password")
+                for table, expected in expected_tables.items():
+                    self.assertEqual(logical_rows(
+                        actual, database, table, password="fixture-password",
+                    ), expected, table)
+            finally:
+                actual.shutdown("fixture-password")
+            reports = [json.loads(run_pipeline.change_report_path(directory, snapshot.version).read_text())
+                       for directory in (baseline_clean, clean)]
+            for report in reports:
+                report.pop("storage")
+            self.assertEqual(reports[0], reports[1])
 
 
 if __name__ == "__main__":

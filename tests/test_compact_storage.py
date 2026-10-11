@@ -159,8 +159,100 @@ class CompactStorageTests(unittest.TestCase):
             self.assertEqual(schema(self.sql), schema(rendered))
         self.assertEqual(rendered.count(begin), 1)
         self.assertEqual(rendered.count("-- OJS_PIPELINE_METADATA_END"), 1)
-        self.assertEqual(COMPACT_STORAGE_PROFILE, "deferred-source-payload-v1")
+        self.assertEqual(COMPACT_STORAGE_PROFILE, "deferred-source-payload-hash-keys-v2")
         self.assertEqual(len(DEFERRED_PAYLOAD_FIELDS), 14)
+
+    def test_membership_stores_hashes_without_repeated_key_values(self):
+        rendered = render_compact_sql(self.sql)
+        for table in ("ojs_stage_keys", "ojs_stage_effective_keys"):
+            schema = rendered.split(f"CREATE TABLE {table} (\n", 1)[1].split(
+                "\n) ENGINE=InnoDB", 1,
+            )[0]
+            with self.subTest(table=table):
+                self.assertNotIn("key_value", schema)
+                self.assertIn("key_hash BINARY(32) NOT NULL", schema)
+                self.assertIn("PRIMARY KEY (source_record_id, key_type)", schema)
+                self.assertIn("key_type ENUM('doi','fingerprint','oai','url') NOT NULL", schema)
+        insert = rendered.split("INSERT INTO ojs_stage_keys\n", 1)[1].split(";", 1)[0]
+        for key_type, hash_column in (("oai", "oai_key_hash"), ("doi", "doi_key_hash"),
+                                      ("url", "url_key_hash"), ("fingerprint", "fingerprint_key_hash")):
+            self.assertRegex(insert, rf"source_record_id,\s*'{key_type}',\s*{hash_column}\s+FROM")
+            self.assertIn(f"WHERE {hash_column} IS NOT NULL", insert)
+        self.assertNotIn("key_value", insert)
+        self.assertEqual(insert.count("UNION ALL"), 3)
+        retained = rendered.split("INSERT INTO ojs_stage_effective_keys\n", 2)[2].split(
+            "SELECT 'OJS_PROGRESS_V1', 'stage', 'noisy_keys';", 1,
+        )[0]
+        self.assertIn(") retained;", retained)
+        self.assertNotIn("identity_key", retained)
+        # Fixed labels have a one-byte representation throughout the temporary
+        # graph. Persistent lookup schema and every emitted label stay intact.
+        self.assertEqual(rendered.count("key_type ENUM('doi','fingerprint','oai','url') NOT NULL"), 6)
+        self.assertEqual(rendered.count("key_type VARCHAR(16) NOT NULL"), 1)
+
+    def test_touched_values_reconstruct_staged_keys_and_snapshot_original_lookup_once_per_hash(self):
+        rendered = render_compact_sql(self.sql)
+        staged = rendered.split("INSERT INTO ojs_stage_touched_keys\n", 1)[1].split(";", 1)[0]
+        self.assertIn("MAX(COALESCE(identity_key.key_value, CASE effective.key_type", staged)
+        for key_type, source_column in (("oai", "oai_key_value"), ("doi", "doi"),
+                                        ("url", "url_key_value"), ("fingerprint", "fingerprint_key_value")):
+            self.assertIn(f"WHEN '{key_type}' THEN staged.{source_column}", staged)
+        self.assertIn("MIN(identity_key.date_added),\n    MAX(identity_key.key_value)", staged)
+        self.assertIn("GROUP BY effective.key_type, effective.key_hash", staged)
+        self.assertEqual(rendered.count("retained_key_value VARCHAR(2048) NULL,"), 1)
+        for alias in ("retired", "noisy"):
+            self.assertIn(
+                f"    {alias}.key_hash,\n    identity_key.key_value,\n"
+                "    identity_key.date_added,\n    identity_key.key_value\n", rendered,
+            )
+        self.assertEqual(rendered.count(
+            "    retained_key_value = COALESCE(\n"
+            "        ojs_stage_touched_keys.retained_key_value,\n"
+            "        VALUES(retained_key_value)\n    ),\n"
+        ), 2)
+
+    def test_final_key_reconstruction_preserves_max_and_retained_null_with_one_unique_join(self):
+        rendered = render_compact_sql(self.sql)
+        anchor = "SELECT 'OJS_PROGRESS_V1', 'stage', 'key_reconciliation';\n"
+        reconciliation = rendered.split(anchor, 1)[1].split(
+            "SELECT 'OJS_PROGRESS_V1', 'stage', 'article_rollup';\n", 1,
+        )[0]
+        self.assertEqual(reconciliation.count(
+            "LEFT JOIN ojs_stage_sources staged\n"
+            "    ON staged.source_record_id = effective.source_record_id\n"
+        ), 1)
+        self.assertEqual(reconciliation.count(
+            "COALESCE(MAX(CASE WHEN staged.source_record_id IS NULL "
+            "THEN touched.retained_key_value ELSE CASE effective.key_type"
+        ), 2)
+        self.assertEqual(reconciliation.count(" END), MAX(touched.key_value))"), 2)
+        self.assertIn("HAVING COUNT(DISTINCT effective.article_id) = 1", reconciliation)
+        self.assertIn("AND noisy.key_hash IS NULL", reconciliation)
+        self.assertIn("COALESCE(MIN(touched.date_added), @ojs_snapshot_date)", reconciliation)
+        self.assertNotIn("effective.key_value", rendered)
+        self.assertNotIn("staged_key.key_value", rendered)
+
+    def test_changed_key_values_and_new_consumers_fail_closed(self):
+        variants = (
+            self.sql.replace("SELECT source_record_id, 'oai', oai_key_hash, oai_key_value",
+                             "SELECT source_record_id, 'oai', oai_key_hash, LOWER(oai_key_value)", 1),
+            self.sql.replace("    key_value VARCHAR(2048) NOT NULL,\n    PRIMARY KEY (source_record_id",
+                             "    key_value TEXT NOT NULL,\n    PRIMARY KEY (source_record_id", 1),
+            self.sql.replace("    oai_key_value VARCHAR(2048) NULL,", "    oai_key_value TEXT NULL,", 1),
+            self.sql.replace("MAX(COALESCE(identity_key.key_value, effective.key_value))",
+                             "MIN(COALESCE(identity_key.key_value, effective.key_value))", 1),
+            self.sql.replace("COALESCE(MAX(effective.key_value), MAX(touched.key_value))",
+                             "COALESCE(MIN(effective.key_value), MAX(touched.key_value))", 1),
+            self.sql.replace("    ON identity_key.key_type = retained.key_type",
+                             "    ON identity_key.key_type <> retained.key_type", 1),
+            self.sql + "\nSELECT old.key_value FROM ojs_stage_keys old;\n",
+            self.sql + "\nSELECT key_value FROM `ojs_stage_effective_keys`;\n",
+            self.sql.replace("        k.source_record_id,", "        k.key_value,", 1),
+            self.sql + "\nSELECT retained_key_value;\n",
+        )
+        for index, sql in enumerate(variants):
+            with self.subTest(variant=index), self.assertRaises(CompactStorageError):
+                render_compact_sql(sql)
 
     def test_existing_table_compression_can_run_before_or_after_rendering(self):
         marker = "/* OJS_COMPACT_TABLE */"

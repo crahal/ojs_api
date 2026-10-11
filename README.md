@@ -16,7 +16,8 @@ documents callers, and [HOW_TO_DEPLOY.md](HOW_TO_DEPLOY.md) covers operations.
 
 Compact builds defer full XML and payload-only text until canonical selection,
 avoiding a large duplicate payload for every source in metadata staging. The
-storage profile is logged and included in release reports. This reduces an
+matching tables also avoid repeated long key text. The storage profile is
+logged and included in release reports. This reduces an
 observed bootstrap bottleneck; it is not a guarantee that the complete dataset
 fits a particular disk size. Keep the disk reserve enabled throughout the build.
 
@@ -27,10 +28,14 @@ A private, ignored `.secrets/beacon.ini` supplies Basic authentication; never
 commit the password. The checked-in cron calls the bounded systemd service at
 03:17 UTC with the server timezone set to UTC: 04:17 London time in summer and
 03:17 in winter. There is one job at a time, including when a build lasts several
-days. The coordinator allows 30 days (`OJS_MAX_RUNTIME_HOURS=720`), bounded by a
-31-day systemd timeout. Applying a new deadline to an active process requires
-a controlled restart; only metadata checkpoints resume, while interrupted
-finalization rebuilds the candidate. See [recovery](HOW_TO_DEPLOY.md#failed-download-or-build).
+days. The coordinator allows 30 days (`OJS_MAX_RUNTIME_HOURS=720`), with a
+31-day systemd work timeout; graceful rollback/shutdown can continue afterwards.
+Applying a new deadline to an active process requires a controlled restart.
+Normal resume accepts metadata checkpoints; explicit audited recovery also
+supports a first snapshot interrupted at exact keys. Later finalization needs
+a reviewed rebuild. Failed candidates are never force-deleted by the daily job.
+Create `data/.updates-paused` to pause future coordinator work while investigating.
+See [recovery](HOW_TO_DEPLOY.md#failed-download-or-build).
 
 Downloads and processing share `data/raw/.source-activity.lock`. The coordinator,
 direct pipeline, Beacon downloader and HTML scraper all use it, so processes

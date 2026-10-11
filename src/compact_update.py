@@ -19,6 +19,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -39,6 +40,7 @@ DATADIR_RE = re.compile(rf"mysql-({DATE})$")
 MARKER = "OJS_COMPACT_RELEASE.json"
 GIB = 1024 ** 3
 COMMAND_TIMEOUT_MESSAGE = "command timed out; check service availability and timeout settings"
+PAUSE_MARKER = ".updates-paused"
 
 
 class UpdateError(RuntimeError):
@@ -210,15 +212,29 @@ class Runner:
             if process.returncode:
                 raise UpdateError(f"update child failed (exit {process.returncode})")
         except BaseException:
+            # A cancelled multi-day INSERT can take hours to roll back. Killing
+            # the Python supervisor after 180 seconds used to strand mysqld and
+            # let systemd SIGKILL it. Keep the lease and wait for safe shutdown.
+            previous_signals = {}
+            if threading.current_thread() is threading.main_thread():
+                for signum in (signal.SIGTERM, signal.SIGINT):
+                    previous_signals[signum] = signal.signal(signum, signal.SIG_IGN)
             try:
-                os.killpg(process.pid, signal.SIGINT)
-                process.wait(timeout=180)
-            except (ProcessLookupError, subprocess.TimeoutExpired):
                 try:
-                    os.killpg(process.pid, signal.SIGKILL)
+                    if process.poll() is None:
+                        os.killpg(process.pid, signal.SIGINT)
                 except ProcessLookupError:
                     pass
-                process.wait()
+                with Progress("update-graceful-shutdown", step="wait-for-child-rollback"):
+                    while True:
+                        try:
+                            process.wait(timeout=30)
+                            break
+                        except subprocess.TimeoutExpired:
+                            pass
+            finally:
+                for signum, previous in previous_signals.items():
+                    signal.signal(signum, previous)
             raise
 
 
@@ -630,9 +646,43 @@ class Coordinator:
         # Keep source exclusion through download, wrangling and publication.
         # Only the intended downloader/pipeline children inherit this lease.
         with source_activity(self.raw), automatic_lock(self.clean):
+            paused = self.root / "data" / PAUSE_MARKER
+            if self.args.recover_exact_keys:
+                # Explicit, supervised one-snapshot recovery; never probe,
+                # download, promote, prune sources, or start later snapshots.
+                if not paused.is_file() or paused.is_symlink():
+                    raise UpdateError("create a regular data/.updates-paused marker before explicit recovery")
+                if self.args.publish_only or self.journal.exists():
+                    raise UpdateError("exact-key recovery cannot be combined with publication/release recovery")
+                version = self.args.recover_exact_keys
+                matches = [safe_child(self.raw, f"pkpbeacon-{version}{suffix}")
+                           for suffix in (".sql.gz", ".sql")
+                           if (self.raw / f"pkpbeacon-{version}{suffix}").exists()]
+                if len(matches) != 1:
+                    raise UpdateError("exact-key recovery requires exactly one raw archive for the requested date")
+                self.compatible_mysql_tools()
+                self.capacity(self.args.min_free_gb)
+                self.memory_capacity()
+                self.guard_build_directories()
+                self.child([sys.executable, str(self.root / "src" / "run_pipeline.py"),
+                            "--raw-dir", str(self.raw), "--clean-dir", str(self.clean),
+                            "--snapshot", str(matches[0]), "--skip-download",
+                            "--resume-building", "--compact-storage", "--recover-exact-keys"],
+                           stage="update-recover-exact-keys")
+                return {"status": "recovered", "release": version, "published": False,
+                        "updates_paused": True}
+            if paused.exists() or paused.is_symlink():
+                return {"status": "paused", "reason": "operator_pause", "marker": str(paused)}
             with run_pipeline.pipeline_lock(self.clean), publish_live.publisher_lock(self.root):
                 self.recover()
             if not self.args.publish_only:
+                # Refuse a failed finalization BEFORE even a new download. Only
+                # an explicit, audited recovery or rebuild may dispose of work.
+                for staging in self.clean.glob("mysql-????-??-??.building"):
+                    safe_child(self.clean, staging.name)
+                    state = run_pipeline.read_build_state(staging)
+                    if state is None or state.get("phase") != "metadata_ready":
+                        raise UpdateError("incomplete build requires manual recovery; candidate retained; no download started")
                 probe = self.probe()
                 current = live_directory(self.clean)
                 known = probe.get("known_snapshot")
@@ -651,7 +701,7 @@ class Coordinator:
                 self.guard_build_directories()
                 self.child([sys.executable, str(self.root / "src" / "run_pipeline.py"),
                             "--raw-dir", str(self.raw), "--clean-dir", str(self.clean),
-                            "--skip-download", "--resume-building", "--force-rebuild", "--compact-storage"],
+                            "--skip-download", "--resume-building", "--compact-storage"],
                            stage="update-build")
                 # Builds can last days; recheck after possible host package changes.
                 self._compatible_tools = None
@@ -671,6 +721,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--credentials-file", type=Path, default=Path(os.getenv("OJS_BEACON_CREDENTIALS_FILE", ".secrets/beacon.ini")))
     result.add_argument("--check", action="store_true", help="read-only HEAD and local status; no locks or writes")
     result.add_argument("--publish-only", action="store_true", help="promote the completed pipeline candidate without downloading or building")
+    result.add_argument("--recover-exact-keys", metavar="YYYY-MM-DD", help="explicit paused bootstrap recovery only; no download, publication or pruning")
     result.add_argument("--no-prune", action="store_true", help="keep prior generated releases after successful promotion")
     result.add_argument("--min-free-gb", type=float, default=float(os.getenv("OJS_MIN_FREE_GB", "20")))
     result.add_argument("--reserve-gb", type=float, default=float(os.getenv("OJS_DISK_RESERVE_GB", "8")))
@@ -682,6 +733,9 @@ def parser() -> argparse.ArgumentParser:
 
 def main(argv=None) -> int:
     args = parser().parse_args(argv)
+    if args.recover_exact_keys and (not re.fullmatch(DATE, args.recover_exact_keys) or args.check or args.publish_only):
+        print("error: recovery requires one YYYY-MM-DD date and cannot use --check/--publish-only", file=sys.stderr)
+        return 2
     limits = (args.min_free_gb, args.reserve_gb, args.max_runtime_hours, args.health_timeout)
     if not all(math.isfinite(value) for value in limits) or min(args.min_free_gb, args.reserve_gb) < 0 or args.max_runtime_hours <= 0 or args.health_timeout <= 0:
         print("error: invalid capacity or timeout setting", file=sys.stderr)

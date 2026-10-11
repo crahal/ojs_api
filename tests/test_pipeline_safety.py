@@ -74,6 +74,166 @@ def create_retained_history(root: Path):
     return raw, clean, snapshots[0], snapshots[1], retained_report
 
 
+class ExactKeysRecoveryFilesystemTests(unittest.TestCase):
+    def recovery_fixture(self, root):
+        version = "2026-01-01"
+        source = root / f"pkpbeacon-{version}.sql"
+        source.write_text(minimal_dump(version), encoding="utf-8")
+        snapshot = run_pipeline.inspect_snapshot(source)
+        clean = root / "clean"
+        staging = clean / f"mysql-{version}.building"
+        staging.mkdir(parents=True)
+        (staging / "records.ibd").write_bytes(b"irreplaceable imported records")
+        build_sql = Path(__file__).parents[1] / "sql" / "01_build_ojs_tables.sql"
+        run_pipeline.write_build_state(
+            staging, snapshot=snapshot,
+            source_sha256=run_pipeline.sha256_small_file(source),
+            build_sql_sha256=run_pipeline.sha256_small_file(build_sql),
+            phase="finalizing",
+        )
+        return staging, dict(
+            snapshot=snapshot, clean_dir=clean, build_sql=build_sql,
+            database="fixture", root_password="fixture",
+            api_db_user="api", api_db_password="fixture",
+            release_thresholds=run_pipeline.ReleaseThresholds(.1, .1, .1, .1),
+            allow_anomalous_release=False, buffer_pool_size="128M",
+            progress_seconds=1, force_rebuild=False, verify_existing=False,
+            verify_source_checksum=False, full_rescan=False, publish_current=False,
+            metadata_workers=1, resume_building=True, compact_storage=True,
+            recover_exact_keys=True,
+        )
+
+    @staticmethod
+    def filesystem_state(root):
+        result = {}
+        for path in root.rglob("*"):
+            identity = path.lstat().st_ino
+            if path.is_symlink():
+                value = ("symlink", identity, str(path.readlink()))
+            elif path.is_file():
+                value = ("file", identity, path.read_bytes())
+            else:
+                value = ("directory", identity)
+            result[str(path.relative_to(root))] = value
+        return result
+
+    def assert_preflight_refused(self, root, options, message):
+        before = self.filesystem_state(root)
+        with mock.patch.object(run_pipeline.MySQLTools, "discover"), \
+                mock.patch.object(run_pipeline, "MySQLServer", side_effect=AssertionError("must not create MySQL server")), \
+                mock.patch.object(run_pipeline.shutil, "rmtree", side_effect=AssertionError("must not delete a database")), \
+                mock.patch.object(Path, "unlink", side_effect=AssertionError("must not delete any artifacts")), \
+                self.assertRaisesRegex(run_pipeline.PipelineError, message):
+            run_pipeline.build_snapshot_database(**options)
+        self.assertEqual(self.filesystem_state(root), before,
+                         "rejected recovery must preserve every file, inode and symlink")
+
+    def test_recovery_requires_compact_resume_without_force(self):
+        for option, value in (("force_rebuild", True), ("compact_storage", False),
+                              ("resume_building", False)):
+            with self.subTest(option=option), TemporaryDirectory() as directory:
+                root = Path(directory)
+                _, options = self.recovery_fixture(root)
+                options[option] = value
+                self.assert_preflight_refused(root, options, "requires compact storage")
+
+    def test_recovery_refuses_missing_or_symlinked_staging_and_checkpoint(self):
+        for target in ("missing_staging", "staging", "checkpoint", "dangling_checkpoint"):
+            with self.subTest(target=target), TemporaryDirectory() as directory:
+                root = Path(directory)
+                staging, options = self.recovery_fixture(root)
+                if target in ("missing_staging", "staging"):
+                    original = root / "original_staging"
+                    staging.rename(original)
+                    if target == "staging":
+                        staging.symlink_to(original, target_is_directory=True)
+                    message = "non-symlinked staging database"
+                else:
+                    checkpoint = run_pipeline.build_state_path(staging)
+                    original = root / "original_checkpoint.json"
+                    checkpoint.rename(original)
+                    checkpoint.symlink_to(original if target == "checkpoint" else root / "missing.json")
+                    message = "symlinked recovery checkpoint"
+                self.assert_preflight_refused(root, options, message)
+
+    def test_recovery_refuses_changed_or_invalid_checkpoint_before_startup(self):
+        cases = (
+            ("phase", "metadata_ready"),
+            ("pipeline_version", "unexpected-version"),
+            ("snapshot_version", "2025-12-01"),
+            ("source_filename", "pkpbeacon-2025-12-01.sql"),
+            ("source_size_bytes", 1),
+            ("build_sql_sha256", "0" * 64),
+            ("source_sha256", "invalid-digest"),
+            ("source_sha256", None),
+            ("missing", None),
+            ("malformed", None),
+            ("non_object", None),
+        )
+        for field, value in cases:
+            with self.subTest(field=field, value=value), TemporaryDirectory() as directory:
+                root = Path(directory)
+                staging, options = self.recovery_fixture(root)
+                path = run_pipeline.build_state_path(staging)
+                if field == "missing":
+                    path.unlink()
+                elif field == "malformed":
+                    path.write_text("{", encoding="utf-8")
+                elif field == "non_object":
+                    path.write_text("[]", encoding="utf-8")
+                else:
+                    state = run_pipeline.read_build_state(staging)
+                    state[field] = value
+                    path.write_text(json.dumps(state), encoding="utf-8")
+                self.assert_preflight_refused(root, options, "checkpoint")
+
+    def test_recovery_refuses_history_live_pointers_and_temporary_outputs(self):
+        artifacts = (
+            ("mysql-live", "symlink"),
+            ("mysql-current", "dangling_symlink"),
+            ("mysql-2025-12-01", "directory"),
+            ("mysql-2026-01-01", "directory"),
+            ("mysql-2026-07-01.building", "directory"),
+            ("pkpbeacon-clean-2025-12-01.sql.gz", "file"),
+            ("pkpbeacon-clean-2025-12-01.sql.gz.sha256", "file"),
+            ("pkpbeacon-changes-2025-12-01.json", "file"),
+            ("pkpbeacon-release-2025-12-01.json", "file"),
+            ("pkpbeacon-clean-current.sql.gz", "dangling_symlink"),
+            (".pkpbeacon-clean-2026-01-01.sql.gz.tmp", "file"),
+            (".pkpbeacon-changes-2026-01-01.json.tmp", "file"),
+            (".pkpbeacon-release-2026-01-01.json.tmp", "dangling_symlink"),
+        )
+        for name, kind in artifacts:
+            with self.subTest(artifact=name), TemporaryDirectory() as directory:
+                root = Path(directory)
+                staging, options = self.recovery_fixture(root)
+                artifact = options["clean_dir"] / name
+                if kind == "symlink":
+                    artifact.symlink_to(staging.name)
+                elif kind == "dangling_symlink":
+                    artifact.symlink_to("missing-target")
+                elif kind == "directory":
+                    artifact.mkdir()
+                    (artifact / "keep.ibd").write_bytes(b"existing dated database")
+                else:
+                    artifact.write_bytes(b"existing release artifact")
+                self.assert_preflight_refused(root, options, "bootstrap-only")
+
+    def test_every_sql_connection_receives_required_session_settings(self):
+        with TemporaryDirectory() as directory:
+            _, options = self.recovery_fixture(Path(directory))
+            prelude = run_pipeline.build_sql_prelude(
+                snapshot=options["snapshot"], source_sha256="1" * 64,
+                build_sql_sha256="2" * 64, mysql_version="8.4.6", full_rescan=False,
+            )
+        for statement in (
+            "SET SESSION group_concat_max_len = 1073741824;",
+            "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;",
+            "SET SESSION sql_mode = 'STRICT_TRANS_TABLES,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION';",
+        ):
+            self.assertIn(statement, prelude)
+
+
 class PipelineSafetyTest(unittest.TestCase):
     def test_force_rebuild_protects_live_pointer_even_when_candidate_is_newer(self):
         with TemporaryDirectory() as directory:

@@ -69,6 +69,11 @@ class SmallHostConfigTest(unittest.TestCase):
         days = int(re.search(r"^TimeoutStartSec=(\d+)d$", service, re.MULTILINE).group(1))
         self.assertGreater(days * 24, defaults.max_runtime_hours)
 
+    def test_service_allows_graceful_database_rollback(self):
+        service = (PROJECT_ROOT / "deploy/ojs-api-update.service").read_text()
+        self.assertIn("\nTimeoutStopSec=infinity\n", service)
+        self.assertIn("\nKillMode=mixed\n", service)
+
 
 if __name__ == "__main__":
     unittest.main()

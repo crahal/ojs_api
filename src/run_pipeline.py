@@ -27,6 +27,7 @@ from typing import BinaryIO, Callable
 from download_beacon import read_validated_metadata, validate_cached_snapshot
 from compact_storage import COMPACT_STORAGE_PROFILE, CompactStorageError, render_compact_sql
 from progress_logging import Progress, progress_interval
+from recovery_checks import validate_bootstrap_exact_keys, wait_innodb_rollback
 from source_activity import (
     SourceActivityBusy, SourceActivityError, source_activity,
     source_activity_child_options,
@@ -43,6 +44,11 @@ METADATA_SHARDS_PER_WORKER = 32
 METADATA_BEGIN_MARKER = "-- OJS_PIPELINE_METADATA_BEGIN"
 METADATA_END_MARKER = "-- OJS_PIPELINE_METADATA_END"
 BUILD_STATE_NAME = "OJS_PIPELINE_STATE.json"
+SQL_SESSION_PRELUDE = (
+    "SET SESSION group_concat_max_len = 1073741824;",
+    "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;",
+    "SET SESSION sql_mode = 'STRICT_TRANS_TABLES,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION';",
+)
 SNAPSHOT_NAME_RE = re.compile(r"pkpbeacon-(\d{4}-\d{2}-\d{2})\.sql(?:\.gz)?$")
 CLEAN_EXPORT_NAME_RE = re.compile(
     r"pkpbeacon-clean-(\d{4}-\d{2}-\d{2})\.sql\.gz$"
@@ -1121,14 +1127,21 @@ class MySQLServer:
             "mysql-shutdown-wait", interval=self.progress_seconds,
             process_pid=self.process_pid(), disk_path=self.datadir.parent,
         ):
-            deadline = time.monotonic() + 120
-            while self.pid_file.exists() and time.monotonic() < deadline:
-                time.sleep(0.25)
-            if self.pid_file.exists():
-                raise PipelineError(
-                    f"MySQL did not shut down cleanly; retaining {self.datadir} "
-                    "and refusing to publish or delete its working files"
-                )
+            while self.pid_file.exists():
+                # Even the SIGTERM fallback can trigger hours of rollback. Do
+                # not exit and surrender the source lease while MySQL is alive.
+                pid = self.process_pid()
+                if pid is None:
+                    if not self.pid_file.exists():
+                        break  # Shutdown completed between the two checks.
+                    raise PipelineError("invalid MySQL PID file during shutdown; working files retained")
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    if not self.pid_file.exists():
+                        break
+                    raise PipelineError("MySQL exited without removing its PID file; unclean working files retained") from None
+                time.sleep(0.5)
         self.running = False
         shutil.rmtree(self.disk_tmp, ignore_errors=True)
         self.runtime.cleanup()
@@ -2138,6 +2151,9 @@ def build_sql_prelude(
 ) -> str:
     return "\n".join(
         (
+            # Each pipeline phase opens a new client session. The settings at
+            # the start of the SQL file otherwise apply only to the prefix.
+            *SQL_SESSION_PRELUDE,
             f"SET @ojs_snapshot_date = {sql_string(snapshot.version)};",
             "SET @ojs_snapshot_completed_at = "
             f"{sql_string(snapshot.completed_at.strftime('%Y-%m-%d %H:%M:%S'))};",
@@ -2312,6 +2328,7 @@ def extract_metadata_in_parallel(
         index, (start, end) = item
         prelude = "\n".join(
             (
+                *SQL_SESSION_PRELUDE,
                 f"SET @ojs_metadata_min_id = {start};",
                 f"SET @ojs_metadata_max_id = {end};",
             )
@@ -2370,6 +2387,7 @@ def build_snapshot_database(
     metadata_workers: int,
     resume_building: bool,
     compact_storage: bool = False,
+    recover_exact_keys: bool = False,
 ) -> tuple[Path, BuildCounts | None]:
     tools = MySQLTools.discover()
     final_dir = clean_dir / f"mysql-{snapshot.version}"
@@ -2381,6 +2399,40 @@ def build_snapshot_database(
     temporary_report = clean_dir / f".{final_report.name}.tmp"
     temporary_manifest = clean_dir / f".{final_manifest.name}.tmp"
     build_sql_sha256 = sha256_small_file(build_sql)
+
+    if recover_exact_keys:
+        # This is intentionally not a general finalization-resume facility.
+        # Refuse before any output invalidation, deletion or MySQL startup.
+        if not compact_storage or not resume_building or force_rebuild:
+            raise PipelineError("exact-key recovery requires compact storage, --resume-building, and no --force-rebuild")
+        if staging_dir.is_symlink() or not staging_dir.is_dir():
+            raise PipelineError("exact-key recovery requires an existing, non-symlinked staging database")
+        forbidden = [p for p in clean_dir.iterdir() if (
+            p.name.startswith(("pkpbeacon-clean-", "pkpbeacon-changes-", "pkpbeacon-release-"))
+            or p.name in ("mysql-current", "mysql-live", final_dir.name)
+            or (p.name.startswith("mysql-") and p != staging_dir)
+        )]
+        if forbidden or any(p.exists() or p.is_symlink() for p in (
+            temporary_export, temporary_report, temporary_manifest,
+        )):
+            raise PipelineError("exact-key recovery is bootstrap-only; existing release/history artifacts must be inspected manually")
+        checkpoint_path = build_state_path(staging_dir)
+        if checkpoint_path.is_symlink():
+            raise PipelineError("refusing a symlinked recovery checkpoint")
+        checkpoint = read_build_state(staging_dir)
+        expected_checkpoint = {
+            "pipeline_version": PIPELINE_VERSION,
+            "snapshot_version": snapshot.version,
+            "source_filename": snapshot.path.name,
+            "source_size_bytes": snapshot.size,
+            "build_sql_sha256": build_sql_sha256,
+            "phase": "finalizing",
+        }
+        if checkpoint is None or any(checkpoint.get(k) != v for k, v in expected_checkpoint.items()):
+            raise PipelineError("exact-key recovery requires the unchanged original finalizing checkpoint")
+        if not isinstance(checkpoint.get("source_sha256"), str) or not re.fullmatch(r"[0-9a-f]{64}", checkpoint["source_sha256"]):
+            raise PipelineError("exact-key recovery checkpoint has an invalid source SHA-256")
+        expected_checkpoint["source_sha256"] = checkpoint["source_sha256"]
 
     for owned_dir in (final_dir, staging_dir):
         if owned_dir.exists():
@@ -2493,6 +2545,7 @@ def build_snapshot_database(
     active_password: str | None = None
     success = False
     counts: BuildCounts | None = None
+    recovery_audit: dict | None = None
     try:
         build_parts = split_build_sql(build_sql, compact_storage)
         if compact_storage:
@@ -2506,7 +2559,23 @@ def build_snapshot_database(
             full_rescan=full_rescan,
         )
 
-        if resuming:
+        if recover_exact_keys:
+            print(f"[recover] starting existing bootstrap database {staging_dir}; no import or metadata replay", flush=True)
+            server.start(active_password)
+            wait_innodb_rollback(server, database=database, password=active_password,
+                                 progress_seconds=progress_seconds)
+            print(f"[checksum] verifying original raw {snapshot.path.name} for recovery", flush=True)
+            source_sha256 = snapshot_sha256(snapshot, progress_seconds)
+            if source_sha256 != checkpoint["source_sha256"]:
+                raise PipelineError("raw SQL checksum does not match the original finalizing checkpoint")
+            recovery_audit = validate_bootstrap_exact_keys(
+                server, database=database, password=active_password,
+                snapshot_version=snapshot.version, source_sha256=source_sha256,
+                build_sql_sha256=build_sql_sha256, checkpoint=checkpoint,
+                expected_checkpoint=expected_checkpoint, progress_seconds=progress_seconds,
+            )
+            print("[recover] bootstrap audit passed; rebuilding generated exact keys only; completed metadata retained", flush=True)
+        elif resuming:
             print(f"[resume] starting {staging_dir}")
             server.start(active_password)
             checkpoint_sha256 = validate_resume_state(
@@ -2578,14 +2647,15 @@ def build_snapshot_database(
                 phase="metadata_ready",
             )
 
-        extract_metadata_in_parallel(
-            server,
-            metadata_sql=build_parts.metadata,
-            database=database,
-            password=active_password,
-            workers=metadata_workers,
-            progress_seconds=progress_seconds,
-        )
+        if not recover_exact_keys:
+            extract_metadata_in_parallel(
+                server,
+                metadata_sql=build_parts.metadata,
+                database=database,
+                password=active_password,
+                workers=metadata_workers,
+                progress_seconds=progress_seconds,
+            )
         write_build_state(
             staging_dir,
             snapshot=snapshot,
@@ -2636,6 +2706,8 @@ def build_snapshot_database(
                 report["source_rows"]["raw_in_snapshot"] if compact_storage else 0
             ),
         }
+        if recovery_audit is not None:
+            report["storage"]["recovery"] = recovery_audit
         anomalies = release_anomalies(report, release_thresholds)
         guard_status = (
             "overridden"
@@ -2974,6 +3046,10 @@ def parser() -> argparse.ArgumentParser:
         help="resume an eligible post-index .building database",
     )
     result.add_argument(
+        "--recover-exact-keys", action="store_true",
+        help="explicit first-snapshot recovery from finalizing/exact_keys only; verify and retain complete metadata",
+    )
+    result.add_argument(
         "--max-active-source-drop-fraction",
         type=float,
         default=os.environ.get("OJS_MAX_ACTIVE_SOURCE_DROP_FRACTION", "0.10"),
@@ -3018,6 +3094,13 @@ def _main(argv: list[str] | None = None) -> int:
     args.raw_dir = args.raw_dir.expanduser().resolve()
     args.clean_dir = args.clean_dir.expanduser().resolve()
     args.build_sql = args.build_sql.expanduser().resolve()
+    if args.recover_exact_keys and (
+        not args.snapshot or not args.skip_download or not args.resume_building
+        or not args.compact_storage or args.force_rebuild or args.rebuild_history
+        or args.download_only or args.force_download
+    ):
+        print("error: exact-key recovery requires --snapshot, --skip-download, --resume-building, --compact-storage, and no force/rebuild/download options", file=sys.stderr)
+        return 2
     if not args.build_sql.is_file():
         print(f"error: build SQL does not exist: {args.build_sql}", file=sys.stderr)
         return 2
@@ -3113,10 +3196,11 @@ def _main(argv: list[str] | None = None) -> int:
                         args.verify_source_checksum and is_target
                     ),
                     full_rescan=args.full_rescan,
-                    publish_current=is_target,
+                    publish_current=is_target and not args.recover_exact_keys,
                     metadata_workers=args.metadata_workers,
                     resume_building=args.resume_building,
                     compact_storage=args.compact_storage,
+                    recover_exact_keys=args.recover_exact_keys,
                 )
                 if not is_target and not args.keep_intermediate_databases:
                     shutil.rmtree(latest_dir)

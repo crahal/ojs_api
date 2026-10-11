@@ -435,11 +435,55 @@ class CompactUpdateTests(unittest.TestCase):
         self.assertEqual(len(self.runner.children), 2)
         self.assertIn("--compact-storage", self.runner.children[-1])
         self.assertIn("--resume-building", self.runner.children[-1])
+        self.assertNotIn("--force-rebuild", self.runner.children[-1])
+
+    def test_operator_pause_prevents_probe_build_and_publication(self):
+        (self.root / "data" / update.PAUSE_MARKER).touch()
+        for publish_only in (False, True):
+            self.args.publish_only = publish_only
+            result = self.coordinator.execute()
+            self.assertEqual(result["status"], "paused")
+        self.assertFalse(self.runner.commands)
+        self.assertFalse(self.runner.children)
+
+    def test_finalizing_candidate_blocks_download_without_discarding_work(self):
+        self.args.publish_only = False
+        staging = self.clean / "mysql-2026-01-01.building"
+        staging.mkdir()
+        (staging / update.run_pipeline.BUILD_STATE_NAME).write_text(json.dumps({"phase": "finalizing"}))
+        preserved = staging / "expensive-work"
+        preserved.write_bytes(b"retained")
+        with self.assertRaisesRegex(update.UpdateError, "manual recovery"):
+            self.coordinator.execute()
+        self.assertEqual(preserved.read_bytes(), b"retained")
+        self.assertFalse(self.runner.commands)
+        self.assertFalse(self.runner.children)
+
+    def test_explicit_recovery_requires_pause_and_never_downloads_or_publishes(self):
+        self.args.publish_only = False
+        self.args.recover_exact_keys = "2026-01-01"
+        with self.assertRaisesRegex(update.UpdateError, "paused"):
+            self.coordinator.execute()
+        (self.root / "data" / update.PAUSE_MARKER).touch()
+        raw = self.raw / "pkpbeacon-2026-01-01.sql.gz"
+        raw.write_bytes(b"retained archive")
+        result = self.coordinator.execute()
+        self.assertEqual(result["status"], "recovered")
+        self.assertFalse(result["published"])
+        self.assertTrue(result["updates_paused"])
+        self.assertEqual(len(self.runner.children), 1)
+        self.assertIn("--recover-exact-keys", self.runner.children[0])
+        self.assertIn(str(raw), self.runner.children[0])
+        self.assertNotIn("--force-rebuild", self.runner.children[0])
+        self.assertFalse(any("--check" in command for command, _ in self.runner.commands))
+        self.assertFalse(self.coordinator.health_calls)
+        self.assertEqual(raw.read_bytes(), b"retained archive")
 
     def test_mounted_staging_database_prevents_child_rebuild(self):
         self.args.publish_only = False
         staging = self.clean / "mysql-2026-01-01.building"
         staging.mkdir()
+        (staging / update.run_pipeline.BUILD_STATE_NAME).write_text('{"phase":"metadata_ready"}')
         self.runner.other_mounts = [staging]
         with self.assertRaisesRegex(update.UpdateError, "mounted or used"):
             self.coordinator.execute()
@@ -499,7 +543,19 @@ class CompactUpdateTests(unittest.TestCase):
                 update.Runner().child(["fake"], cwd=self.root, env={}, timeout=60,
                                       reserve_check=mock.Mock(side_effect=update.UpdateError("reserve")))
         kill.assert_called_once_with(1234, update.signal.SIGINT)
-        process.wait.assert_called_once_with(timeout=180)
+        process.wait.assert_called_once_with(timeout=30)
+
+    def test_slow_rollback_is_not_force_killed(self):
+        process = mock.Mock(pid=1234)
+        process.poll.return_value = None
+        process.wait.side_effect = [subprocess.TimeoutExpired("fake", 30)] * 8 + [0]
+        with mock.patch.object(update.subprocess, "Popen", return_value=process), \
+             mock.patch.object(update.os, "killpg") as kill:
+            with self.assertRaisesRegex(update.UpdateError, "reserve"):
+                update.Runner().child(["fake"], cwd=self.root, env={}, timeout=60,
+                                      reserve_check=mock.Mock(side_effect=update.UpdateError("reserve")))
+        kill.assert_called_once_with(1234, update.signal.SIGINT)
+        self.assertEqual(process.wait.call_count, 9)
 
     def test_real_health_check_requires_authenticated_provenance_and_exact_mount(self):
         candidate = release(self.root, "2026-01-01")

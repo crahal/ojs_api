@@ -19,7 +19,9 @@ Install `deploy/ojs-api-update.service`, `deploy/journald-ojs-api.conf` and
 04:17 in London during British Summer Time and 03:17 during GMT. Systemd runs
 it as `ojs` with a 2 GiB memory limit and 1 GiB swap allowance. The coordinator's
 `OJS_MAX_RUNTIME_HOURS=720` permits 30 days, with `TimeoutStartSec=31d` as the
-service's outer limit. A multi-day run cannot overlap itself. Do not also enable
+service's outer work limit. Cancellation waits for graceful database shutdown,
+which can take longer; it does not force-kill a slow rollback. A multi-day run
+cannot overlap itself. Do not also enable
 the optional timer. `scripts/automatic_update.sh` sources the private environment and calls
 `src/compact_update.py`; source passwords are read from a private INI file.
 
@@ -122,12 +124,19 @@ unknown validators invalidate a partial; gzip CRC/footer/hash validation must
 pass before publication. An immutable same-date revision stops for review.
 
 An interrupted pipeline can resume a validated checkpoint during metadata
-processing. Finalization has no resumable checkpoint: interrupting the
-`finalizing` phase requires rebuilding the generated candidate, including work
-already done in that phase. The previous serving release remains separate.
+processing. Normal resume refuses `finalizing` and automatic updates never
+force-delete a failed candidate. There is one explicit recovery exception for
+an untouched first-snapshot catalogue interrupted at exact keys; it audits and
+retains completed metadata. See the [preservation and recovery procedure](LIGHTSAIL_DEPLOYMENT.md#failed-bootstrap-at-exact-keys-preserve-inspect-then-recover).
+Later finalization requires a separately reviewed rebuild. The previous serving
+release, if one exists, remains separate; an unfinished bootstrap has none.
 Keep the failed report/log while investigating. Increase disk/RAM only after
 seeing which resource failed; do not bypass release guards to solve resource
-errors.
+errors. A regular `data/.updates-paused` file prevents future automatic build,
+download and publication attempts; it does not stop a process already running.
+Remove it only after reviewing the failure. Graceful shutdown retains the source
+lock and emits progress while MySQL finishes rollback, without a forced-kill
+deadline. Do not interpret `deactivating` as permission to start another server.
 
 The 30-day coordinator deadline is captured when its Python process starts.
 Editing `.env` and running `systemctl daemon-reload` does not extend that running

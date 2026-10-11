@@ -242,7 +242,8 @@ with the attached static IPv4 address. This deployment uses
 at their defaults for the first build.
 
 `OJS_MAX_RUNTIME_HOURS=720` allows 30 days per coordinator run; the service's
-`TimeoutStartSec=31d` is the outer limit. These are failure cutoffs, not an ETA.
+`TimeoutStartSec=31d` is the outer work limit. These are cancellation cutoffs,
+not an ETA; graceful MySQL rollback/shutdown may continue beyond them.
 Changing `.env` or reloading a unit does not reset the deadline already captured
 by a running Python process. Applying a new deadline to an active build requires
 a controlled restart; read the
@@ -373,14 +374,19 @@ a build. A memory-limit failure is reported and the old release remains live.
 
 ### Compact-storage upgrade and checkpoint recovery
 
-The `deferred-source-payload-v1` profile avoids persisting full XML and 13
+The `deferred-source-payload-hash-keys-v2` profile avoids persisting full XML and 13
 payload-only text columns for every source alias. It releases matching work
 tables after their last use, and reclaims imported record storage after the
 canonical payloads exist. Before reclaiming it, the job saves the exact raw-row
 count, snapshot date and source hash; permanent reports retain the correct raw
 and excluded-row counts. Immutable source archives are not removed by this
 optimization. The report records the profile, rendered SQL digest and count of
-reclaimed imported rows separately from bibliometric removals.
+reclaimed imported rows separately from bibliometric removals. Exact/effective
+matching tables store hashes without duplicating long key text; temporary key
+types use one-byte values. Original key text is recovered through indexed
+source lookups or a single retained value per touched key. Matching, stable
+IDs, exclusions, tombstones, events and API payloads remain unchanged; real
+MySQL regression tests compare every clean-table field across three snapshots.
 
 This profile reduces measured bootstrap waste; the final peak still needs a
 complete full-data run. Do not disable the disk reserve or delete `.ibd` files.
@@ -392,14 +398,95 @@ retains the imported records and source index, verifies the source checksum,
 truncates only the generated metadata staging table, and repeats metadata
 extraction. Completed metadata ranges are not retained. Source SQL and its
 checksum are unchanged by this storage-only renderer; never edit a checkpoint
-to bypass a mismatch. A `finalizing` checkpoint requires a fresh candidate
-build, and reclamation audit evidence also forbids metadata-only resume.
+to bypass a mismatch. Normal resume refuses `finalizing`; a narrowly scoped,
+explicit bootstrap recovery is described below. Later finalization and raw
+reclamation cannot use that recovery path.
 
 Before restarting, record the checkpoint phase and free space, obtain approval
 for repeated work, and verify clean MySQL shutdown. Confirm `[resume]` and
-`[storage] profile=deferred-source-payload-v1` in the new run. Import/index file
+`[storage] profile=deferred-source-payload-hash-keys-v2` in the new run. Import/index file
 identities should remain unchanged; do not mistake checksum verification for
 a second import. Leave the cron/source lock in place so downloads stay excluded.
+
+### Failed bootstrap at exact keys: preserve, inspect, then recover
+
+Automatic updates never pass `--force-rebuild`. An incomplete candidate without
+a `metadata_ready` checkpoint blocks the next download and requires inspection.
+The `data/.updates-paused` marker additionally disables coordinator download,
+build and publication until explicitly removed. Read-only `--check` remains
+available; the marker does not stop an already running process or a direct
+manual pipeline invocation.
+
+On a server still running the older code, pause its cron first. This consolidated
+block is for the **Lightsail Ubuntu terminal**, not AWS CloudShell. It only
+pauses future automatic invocations and prints diagnostics; it does not kill a
+running database, delete data, or start a recovery:
+
+```bash
+cd /srv/ojs_api
+sudo -u ojs touch data/.updates-paused
+if sudo test -f /etc/cron.d/ojs-api; then
+  if sudo test -e /etc/ojs-api-cron.paused; then
+    echo 'Both cron files exist: inspect them before proceeding.'
+  else
+    sudo mv /etc/cron.d/ojs-api /etc/ojs-api-cron.paused
+  fi
+fi
+sudo systemctl disable --now ojs-api-update.timer 2>/dev/null || true
+sudo systemctl show ojs-api-update.service -p ActiveState -p SubState -p Result -p TimeoutStopUSec
+sudo ps -C mysqld -o pid,ppid,stat,etime,comm
+df -h / /srv/ojs_api/data
+sudo du -xhd1 /srv/ojs_api/data/clean
+sudo cat data/clean/mysql-2026-01-01.building/OJS_PIPELINE_STATE.json
+sudo journalctl -u ojs-api-update.service -n 40 --no-pager
+```
+
+The October 2026 failure reached the 8 GiB reserve with an approximately
+154 GiB candidate and 88 GiB of compressed inputs on a 251 GiB filesystem.
+The partial exact-key table alone occupied approximately 27 GiB. These are
+observations from an unfinished build, **not a complete capacity estimate**.
+The default 20 GiB starting floor intentionally rejects that host as-is.
+Establish headroom before recovery; do not lower the reserve, remove `.ibd` or
+undo/redo files, change the checkpoint phase, or buy storage automatically.
+Free space on `/` is not automatically available to the data filesystem.
+
+After capacity and the stopped candidate have been reviewed, install the tested
+code and the updated service. The service now uses `KillMode=mixed` and
+`TimeoutStopSec=infinity`; the coordinator and MySQL shutdown wait with progress
+instead of force-killing a rollback. Inspect `systemctl cat` for older drop-ins
+that override these settings. A forced kill or reboot is not a clean shutdown.
+[MySQL explains that background rollback can outlast startup](https://dev.mysql.com/doc/refman/8.4/en/innodb-recovery.html).
+
+Explicit recovery is invoked by replacing the update service's `ExecStart`
+temporarily with:
+
+```ini
+[Service]
+ExecStart=
+ExecStart=/srv/ojs_api/scripts/automatic_update.sh --recover-exact-keys 2026-01-01
+```
+
+Keep the pause marker and cron pause in place. Use a named drop-in such as
+`/etc/systemd/system/ojs-api-update.service.d/exact-key-recovery.conf`, reload
+systemd, verify the effective unit, then start it with `--no-block`. Do not paste
+this as a blind restart while only 8 GiB is free.
+
+Recovery keeps all source archives and the imported/indexed/parsed data. It
+waits for normal InnoDB crash rollback, verifies the original source checksum,
+requires empty clean history and no later-stage tables, and checks raw/context
+coverage, metadata membership, identities and hashes in bounded ID ranges.
+Only after those checks does it drop/rebuild the generated exact-key table and
+run the smaller finalization. A failed audit leaves the candidate for inspection.
+It never edits the checkpoint to pretend metadata extraction is incomplete.
+
+Progress stages include `recovery-rollback`, `recovery-metadata-audit` and the
+normal finalization stages; the successful report includes `storage.recovery`.
+This is **not** a general interrupted-finalization resume. It creates only the
+first dated clean release: no download, API switch, archive pruning or later
+snapshot starts. After verification, remove only the named recovery drop-in,
+review capacity for subsequent snapshots, and restore normal scheduling and
+remove the pause marker deliberately. Do not use `systemctl revert` to erase
+unrelated operator settings. The API is not ready merely because recovery starts.
 
 ## 7. Smoke-test the API and configure HTTPS
 

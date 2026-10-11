@@ -39,4 +39,7 @@ RestrictSUIDSGID=true
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 ReadWritePaths=/srv/ojs_api/data
 TimeoutStartSec=31d
-TimeoutStopSec=5min
+# InnoDB rollback after a cancelled large INSERT may take hours. Let the
+# coordinator interrupt the pipeline and wait; do not force-kill the database.
+KillMode=mixed
+TimeoutStopSec=infinity

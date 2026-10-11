@@ -25,6 +25,51 @@ def events(output: str) -> list[dict]:
 
 
 class PipelineLoggingTest(unittest.TestCase):
+    def test_shutdown_waits_for_slow_fallback_without_a_kill_deadline(self):
+        with TemporaryDirectory() as directory:
+            server = run_pipeline.MySQLServer(
+                run_pipeline.MySQLTools("unused", "unused", "unused", "unused", "8.4.0"),
+                Path(directory) / "mysql", "128M",
+            )
+            server.running = True
+            pid_file = mock.Mock()
+            pid_file.read_text.return_value = "9876"
+            # First check triggers the fallback, followed by >120 seconds of
+            # simulated shutdown polling, then successful PID-file removal.
+            pid_file.exists.side_effect = [True] * 501 + [False]
+            with mock.patch.object(server, "pid_file", pid_file), \
+                 mock.patch.object(server, "_run_control", return_value=subprocess.CompletedProcess([], 1)), \
+                 mock.patch.object(run_pipeline.os, "kill") as kill, \
+                 mock.patch.object(run_pipeline.time, "sleep") as sleep:
+                server.shutdown(None)
+            self.assertEqual(sleep.call_count, 500)
+            self.assertEqual(kill.call_args_list[0], mock.call(9876, signal.SIGTERM))
+            self.assertTrue(all(call.args[1] in (0, signal.SIGTERM) for call in kill.call_args_list))
+            self.assertFalse(server.running)
+
+    def test_every_metadata_worker_receives_original_session_settings(self):
+        server = mock.Mock()
+        server.execute.return_value = "1\t2"
+        run_pipeline.extract_metadata_in_parallel(
+            server, metadata_sql="SELECT 1;", database="fixture", password=None,
+            workers=1, progress_seconds=30,
+        )
+        for call in server.run_sql_text.call_args_list:
+            for setting in run_pipeline.SQL_SESSION_PRELUDE:
+                self.assertIn(setting, call.kwargs["prelude"])
+
+    def test_clean_shutdown_pid_file_removal_race_is_not_an_error(self):
+        with TemporaryDirectory() as directory:
+            server = self.make_server(directory)
+            server.running = True
+            pid_file = mock.Mock()
+            pid_file.exists.side_effect = [True, False]
+            with mock.patch.object(server, "pid_file", pid_file), \
+                 mock.patch.object(server, "process_pid", return_value=None), \
+                 mock.patch.object(server, "_run_control", return_value=subprocess.CompletedProcess([], 0)):
+                server.shutdown(None)
+            self.assertFalse(server.running)
+
     def make_server(self, directory: str):
         server = run_pipeline.MySQLServer(
             run_pipeline.MySQLTools("unused", "unused", "unused", "unused", "8.4.0"),

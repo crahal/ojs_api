@@ -87,6 +87,10 @@ normally synchronize.
    ID merely because its source ID is lower. A later correction prevents new
    false matches but does not automatically split an already published merge;
    that requires a reviewed history rebuild.
+   Compact mode keeps hashes, not repeated long key text, in the two large
+   matching-membership tables. It retrieves the original text through indexed
+   source lookups and keeps one historical value per touched key where needed.
+   This saves temporary disk without changing matching decisions.
 
 8. **Choose the canonical row.** For each article, active and present sources
    are preferred, followed by richer metadata, then the lowest source ID as a
@@ -132,7 +136,9 @@ The daily check runs at 03:17 UTC on a server configured for UTC: 04:17 London
 time during British Summer Time and 03:17 during GMT. It leaves an active build
 running and does not start an overlapping copy. One coordinator run can last
 up to `OJS_MAX_RUNTIME_HOURS=720` (30 days); the systemd service has a 31-day
-outer limit. Neither limit predicts how long the catalogue will take.
+outer work limit. Neither limit predicts how long the catalogue will take.
+Cancellation keeps the source lock while MySQL shuts down or rolls back;
+that cleanup can continue beyond the work deadline and is not force-killed.
 
 The production service records progress in the system journal. Reconnect over
 SSH at any time and run:
@@ -184,8 +190,14 @@ so there is no measured whole-build ETA or honest global percentage. A stage's
 or become live. A kill/reboot may prevent a final event: consult systemd status.
 
 Validated metadata-processing checkpoints can resume after interruption.
-Finalization, including deduplication and lifecycle work, cannot resume midway;
-an interrupted `finalizing` candidate must be rebuilt. Increasing the runtime
+Normal resume cannot replay finalization safely. A separate, explicit recovery
+can retain completed metadata only for the first snapshot interrupted at exact
+keys, after original hashes, source coverage, metadata and empty history pass
+validation. Later stages require a reviewed rebuild. Automatic updates retain
+failed candidates and refuse new downloads rather than force-rebuilding them.
+The `data/.updates-paused` marker also prevents future coordinator work.
+See the [recovery procedure](LIGHTSAIL_DEPLOYMENT.md#failed-bootstrap-at-exact-keys-preserve-inspect-then-recover).
+Increasing the runtime
 setting does not change the deadline of a process already running, so applying
 it immediately requires a controlled restart with that rebuild cost. See the
 [restart procedure](HOW_TO_DEPLOY.md#failed-download-or-build).

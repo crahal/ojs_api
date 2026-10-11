@@ -6,13 +6,77 @@ an XML and Dublin Core payload copy for every source alias. The source schema
 is retained so existing metadata-ready checkpoints can use normal truncation.
 Completed work tables are reclaimed before later stages build their own tables.
 Raw rows are counted and reclaimed only after canonical payloads own their XML.
+Key membership stores hashes, not repeated key text. Original retained key text
+is saved once per touched hash before persistent lookups are reconciled.
 """
 from __future__ import annotations
 
 import re
 
 
-COMPACT_STORAGE_PROFILE = "deferred-source-payload-v1"
+COMPACT_STORAGE_PROFILE = "deferred-source-payload-hash-keys-v2"
+_KEY_TABLES = (
+    "ojs_stage_keys", "ojs_stage_effective_keys", "ojs_stage_noisy_keys",
+    "ojs_stage_touched_keys", "ojs_stage_key_labels", "ojs_stage_changed_keys",
+)
+# Lexical order agrees with VARCHAR order for these four fixed ASCII labels.
+_KEY_TYPE = "ENUM('doi','fingerprint','oai','url')"
+_STAGED_KEY_VALUE = """CASE effective.key_type
+            WHEN 'oai' THEN staged.oai_key_value
+            WHEN 'doi' THEN staged.doi
+            WHEN 'url' THEN staged.url_key_value
+            WHEN 'fingerprint' THEN staged.fingerprint_key_value
+        END"""
+_EXACT_KEYS_INSERT = """INSERT INTO ojs_stage_keys
+SELECT source_record_id, 'oai', oai_key_hash, oai_key_value
+FROM ojs_stage_sources
+WHERE oai_key_hash IS NOT NULL
+UNION ALL
+SELECT source_record_id, 'doi', doi_key_hash, doi
+FROM ojs_stage_sources
+WHERE doi_key_hash IS NOT NULL
+UNION ALL
+SELECT source_record_id, 'url', url_key_hash, url_key_value
+FROM ojs_stage_sources
+WHERE url_key_hash IS NOT NULL
+UNION ALL
+SELECT
+    source_record_id,
+    'fingerprint',
+    fingerprint_key_hash,
+    fingerprint_key_value
+FROM ojs_stage_sources
+WHERE fingerprint_key_hash IS NOT NULL;
+"""
+_RETAINED_KEYS_END = """) retained
+LEFT JOIN ojs_article_keys identity_key
+    ON identity_key.key_type = retained.key_type
+   AND identity_key.key_hash = retained.key_hash;
+"""
+_TOUCHED_KEYS_INSERT = """INSERT INTO ojs_stage_touched_keys
+SELECT
+    effective.key_type,
+    effective.key_hash,
+    MAX(COALESCE(identity_key.key_value, effective.key_value)),
+    MIN(identity_key.date_added)
+FROM ojs_stage_effective_keys effective
+INNER JOIN ojs_stage_sources staged
+    ON staged.source_record_id = effective.source_record_id
+LEFT JOIN ojs_article_keys identity_key
+    ON identity_key.key_type = effective.key_type
+   AND identity_key.key_hash = effective.key_hash
+GROUP BY effective.key_type, effective.key_hash;
+"""
+_TOUCHED_KEYS_UPDATE = """    key_value = COALESCE(
+        ojs_stage_touched_keys.key_value,
+        VALUES(key_value)
+    ),
+"""
+_RECONCILE_KEYS_JOIN = """INNER JOIN ojs_stage_touched_keys touched
+    ON touched.key_type = effective.key_type
+   AND touched.key_hash = effective.key_hash
+"""
+_RECONCILE_KEY_VALUE = "COALESCE(MAX(effective.key_value), MAX(touched.key_value))"
 _PAYLOAD_COLUMNS = (
     ("creators", "MEDIUMTEXT", "//dc:creator"),
     ("subjects", "MEDIUMTEXT", "//dc:subject"),
@@ -106,6 +170,135 @@ def _progress_anchor(stage: str) -> str:
     return f"SELECT 'OJS_PROGRESS_V1', 'stage', '{stage}';\n"
 
 
+def _defer_key_values(sql: str) -> str:
+    """Preserve exact per-alias values while storing only hash membership.
+
+    The final join is one-to-one on the metadata stage's primary key, never a
+    join of all aliases sharing a hash. Retained values must be snapshotted
+    separately: touched.key_value can instead contain a new staged value when
+    the original persistent lookup was absent. Coalescing those prematurely
+    would not preserve the original NULL and MAX semantics.
+    """
+    if re.search(r"\bretained_key_value\b", sql, re.IGNORECASE):
+        raise CompactStorageError("compact storage found existing retained_key_value")
+    source_schema = _table_schema(sql, "ojs_stage_sources")
+    for name, column_type in (("oai_key_value", "VARCHAR(2048)"),
+                              ("doi", "VARCHAR(255)"),
+                              ("url_key_value", "VARCHAR(2048)"),
+                              ("fingerprint_key_value", "VARCHAR(2048)")):
+        _require_once(source_schema, f"    {name} {column_type} NULL,", f"source key value {name}")
+    _require_once(source_schema, "    PRIMARY KEY (source_record_id)", "unique source key-value lookup")
+
+    # Every insertion and consumer of the two removed text columns is checked
+    # before replacing it. Reject extra consumers, including alternate aliases
+    # and unqualified SELECTs, instead of returning SQL that fails after hours.
+    expected_references = {"ojs_stage_keys": 11, "ojs_stage_effective_keys": 10}
+    for table, expected in expected_references.items():
+        if len(re.findall(rf"\b{table}\b", sql, re.IGNORECASE)) != expected:
+            raise CompactStorageError(f"compact storage found unexpected references to {table}")
+    for column, count in (("staged_key.key_value", 1), ("effective.key_value", 3)):
+        if len(re.findall(rf"\b{re.escape(column)}\b", sql, re.IGNORECASE)) != count:
+            raise CompactStorageError(f"compact storage found unexpected consumers of {column}")
+    if len(re.findall(r"\bkey_value\b", sql, re.IGNORECASE)) != 21:
+        raise CompactStorageError("compact storage found unexpected key value consumers")
+
+    for table in _KEY_TABLES:
+        schema = _table_schema(sql, table)
+        key_type = "    key_type VARCHAR(16) NOT NULL,"
+        _require_once(schema, key_type, f"{table} key type")
+        compact_schema = schema.replace(key_type, f"    key_type {_KEY_TYPE} NOT NULL,", 1)
+        if table in ("ojs_stage_keys", "ojs_stage_effective_keys"):
+            nullable = "NOT NULL" if table == "ojs_stage_keys" else "NULL"
+            declaration = f"    key_value VARCHAR(2048) {nullable},\n"
+            _require_once(schema, declaration, f"{table} key value")
+            compact_schema = compact_schema.replace(declaration, "", 1)
+        elif table == "ojs_stage_touched_keys":
+            _require_once(schema, "    key_value VARCHAR(2048) NULL,", "touched key value")
+            declaration = "    date_added DATE NULL,\n"
+            _require_once(schema, declaration, "touched key date")
+            compact_schema = compact_schema.replace(
+                declaration, declaration + "    retained_key_value VARCHAR(2048) NULL,\n", 1,
+            )
+        original = f"CREATE TABLE {table} (\n{schema}\n) ENGINE=InnoDB"
+        replacement = f"CREATE TABLE {table} (\n{compact_schema}\n) ENGINE=InnoDB"
+        sql = sql.replace(original, replacement, 1)
+
+    _require_once(sql, _EXACT_KEYS_INSERT, "exact key insertion")
+    membership = _EXACT_KEYS_INSERT
+    for text in (", oai_key_value", ", doi\n", ", url_key_value"):
+        membership = membership.replace(text, "\n" if text.endswith("\n") else "", 1)
+    membership = membership.replace("fingerprint_key_hash,\n    fingerprint_key_value", "fingerprint_key_hash", 1)
+    sql = sql.replace(_EXACT_KEYS_INSERT, membership, 1)
+
+    staged = """INSERT INTO ojs_stage_effective_keys
+SELECT
+    staged_key.source_record_id,
+    staged_key.key_type,
+    staged_key.key_hash,
+    staged_key.key_value,
+    prior.article_id,
+    1
+FROM ojs_stage_keys staged_key
+LEFT JOIN ojs_article_sources prior
+    ON prior.source_record_id = staged_key.source_record_id;
+"""
+    _require_once(sql, staged, "staged effective key insertion")
+    sql = sql.replace(staged, staged.replace("    staged_key.key_value,\n", "", 1), 1)
+    retained = """INSERT INTO ojs_stage_effective_keys
+SELECT
+    retained.source_record_id,
+    retained.key_type,
+    retained.key_hash,
+    identity_key.key_value,
+    retained.article_id,
+    retained.is_present
+FROM ("""
+    _require_once(sql, retained, "retained effective key insertion")
+    _require_once(sql, _RETAINED_KEYS_END, "retained effective key lookup")
+    sql = sql.replace(retained, retained.replace("    identity_key.key_value,\n", "", 1), 1)
+    sql = sql.replace(_RETAINED_KEYS_END, ") retained;\n", 1)
+
+    _require_once(sql, _TOUCHED_KEYS_INSERT, "touched staged key insertion")
+    touched = _TOUCHED_KEYS_INSERT.replace("effective.key_value", _STAGED_KEY_VALUE, 1).replace(
+        "    MIN(identity_key.date_added)\n",
+        "    MIN(identity_key.date_added),\n    MAX(identity_key.key_value)\n", 1,
+    )
+    sql = sql.replace(_TOUCHED_KEYS_INSERT, touched, 1)
+    for alias in ("retired", "noisy"):
+        projection = f"""INSERT INTO ojs_stage_touched_keys
+SELECT
+    {alias}.key_type,
+    {alias}.key_hash,
+    identity_key.key_value,
+    identity_key.date_added
+"""
+        _require_once(sql, projection, f"touched {alias} key insertion")
+        sql = sql.replace(projection, projection.replace(
+            "    identity_key.date_added\n",
+            "    identity_key.date_added,\n    identity_key.key_value\n", 1,
+        ), 1)
+    if sql.count(_TOUCHED_KEYS_UPDATE) != 2:
+        raise CompactStorageError("compact storage requires both touched key updates")
+    sql = sql.replace(_TOUCHED_KEYS_UPDATE, _TOUCHED_KEYS_UPDATE + """    retained_key_value = COALESCE(
+        ojs_stage_touched_keys.retained_key_value,
+        VALUES(retained_key_value)
+    ),
+""")
+
+    _require_once(sql, _RECONCILE_KEYS_JOIN, "reconciled key membership join")
+    if sql.count(_RECONCILE_KEY_VALUE) != 2:
+        raise CompactStorageError("compact storage requires both reconciled key value expressions")
+    sql = sql.replace(_RECONCILE_KEYS_JOIN, _RECONCILE_KEYS_JOIN + """LEFT JOIN ojs_stage_sources staged
+    ON staged.source_record_id = effective.source_record_id
+""", 1)
+    # Use presence, not COALESCE, to preserve missing retained identity values.
+    key_value = ("COALESCE(MAX(CASE WHEN staged.source_record_id IS NULL "
+                 "THEN touched.retained_key_value ELSE " + _STAGED_KEY_VALUE
+                 + " END), MAX(touched.key_value))")
+    sql = sql.replace(_RECONCILE_KEY_VALUE, key_value)
+    return sql
+
+
 def _reclaim_completed_worktables(sql: str) -> str:
     phases = ("source_reconciliation", "source_indexes", "key_reconciliation",
               "article_rollup", "stage_cleanup")
@@ -158,7 +351,7 @@ def _reclaim_raw_records(sql: str) -> str:
 def render_compact_sql(sql: str) -> str:
     """Defer staged payload and reclaim finished work, rejecting unsupported SQL.
 
-    This does not change the source file, existing table definitions, metadata
+    This does not change the source file, persistent table definitions, metadata
     hashes, matching keys, canonical choice, or unchanged-source fallback.
     Raw source archives are untouched. Existing compact-table marker
     substitution may run before or after this function.
@@ -209,4 +402,4 @@ def render_compact_sql(sql: str) -> str:
     )
     suffix = before_canonical + _CANONICAL_BEGIN + projection + joined + after_canonical
     rendered = prefix + _METADATA_BEGIN + metadata + _METADATA_END + suffix
-    return _reclaim_raw_records(_reclaim_completed_worktables(rendered))
+    return _reclaim_raw_records(_reclaim_completed_worktables(_defer_key_values(rendered)))
