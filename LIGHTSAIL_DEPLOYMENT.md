@@ -452,6 +452,78 @@ To stop future scheduled reports, run
 or change recovery. Revoke the dedicated Gmail app password when reporting is
 no longer needed.
 
+#### Optional AI-written progress summary
+
+An optional OpenAI call adds a short interpretation above the measured facts in
+each Gmail report. The existing Gmail configuration and recovery job continue
+unchanged. If generation fails or its local request allowance is exhausted, the
+reporter sends the ordinary factual report. The model cannot run commands or
+change the server; its interpretation is not evidence that recovery succeeded.
+
+The model is fixed to `gpt-6-luna` with Standard processing. On 11 October 2026,
+[official pricing](https://developers.openai.com/api/docs/models/gpt-6-luna)
+is USD 0.10 per million input tokens and USD 0.50 per million output tokens.
+At 60 requests per month, assuming 2,000 input tokens and the maximum 512 output
+tokens each, the estimated model cost is about **USD 0.03/month**. Prices and
+actual token usage can change; this estimate is not an account-wide spending cap.
+Any minimum funding requirement for the API account is separate from this usage
+estimate.
+
+Each request has at most 8 KiB of input and 512 output tokens, with one attempt
+and no automatic retries. The reporter allows at most two attempts per UTC day
+and 65 per UTC month. Failed requests, paid previews and forced checks count
+toward these limits; `--force` does not bypass the AI allowance. The bounded
+`/var/lib/ojs-api-report/llm-budget.json` usage record is local to this reporter
+and does not limit other API clients.
+
+OpenAI receives only selected, sanitized status fields and counters, excluding
+raw logs, database contents, credentials, email addresses, process IDs and
+invocation IDs. Requests set `store=false`; this does not guarantee zero
+retention under OpenAI's [data controls](https://developers.openai.com/api/docs/guides/your-data).
+The existing `--dry-run` remains offline and needs no API credential.
+
+In an interactive Lightsail terminal, enter an OpenAI API key at the helper's
+hidden prompt. Never put the key in chat, command arguments, environment
+variables or Git. The helper writes root-owned, mode-600
+`/etc/ojs-api/progress-openai-key` and refuses to overwrite an existing key:
+
+```bash
+cd /srv/ojs_api
+sudo python3 /srv/ojs_api/scripts/configure_progress_openai.py &&
+sudo bash /srv/ojs_api/scripts/preview_progress_ai.sh &&
+sudo install -d -o root -g root -m 755 /etc/systemd/system/ojs-api-progress-email.service.d &&
+sudo install -o root -g root -m 644 deploy/ojs-api-progress-email-openai.conf /etc/systemd/system/ojs-api-progress-email.service.d/30-openai.conf &&
+sudo systemctl daemon-reload
+```
+
+The optional drop-in enables `OJS_PROGRESS_LLM_ENABLED=1` and supplies the key
+with `LoadCredential=openai-api-key:/etc/ojs-api/progress-openai-key`. It does not
+replace the Gmail credential or start, stop or restart recovery. The reporter's
+`--preview-llm`, invoked by `preview_progress_ai.sh`, explicitly requests a paid
+generation test in a temporary constrained service with only the OpenAI
+credential. It sends no email and leaves `last-sent.json` unchanged. It shares
+the normal reporter lock and request allowance, so a preview can consume an
+attempt otherwise available to a scheduled report. The commands above install
+the drop-in only after that preview succeeds. The existing timer then uses AI
+on its next report; there is no need to trigger an extra email.
+
+If the preview fails after the key was saved, leave the drop-in uninstalled and
+inspect API access or the local attempt limit before retrying the preview; the
+key helper refuses repeat installation. Keep the key file while the drop-in is
+installed: a missing file makes systemd reject service startup before the
+reporter's factual fallback can run.
+
+To return to factual Gmail reports, remove only this optional drop-in and reload
+systemd. The next email run then omits AI generation:
+
+```bash
+sudo rm -- /etc/systemd/system/ojs-api-progress-email.service.d/30-openai.conf &&
+sudo systemctl daemon-reload
+```
+
+This keeps the API key file, Gmail setup, reporting timer and recovery settings
+in place. Revoke the dedicated API key separately if it is no longer needed.
+
 ### Compact-storage upgrade and checkpoint recovery
 
 The `deferred-source-payload-hash-keys-v2` profile avoids persisting full XML and 13

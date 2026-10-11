@@ -27,6 +27,8 @@ import sys
 import tempfile
 import time
 
+import progress_llm
+
 
 SERVICE = "ojs-api-update.service"
 DEFAULT_STATE = Path("/var/lib/ojs-api-report/last-sent.json")
@@ -377,6 +379,103 @@ def quantity(value) -> str:
     return "unavailable" if value is None else f"{value / (1024 ** 3):.2f} GiB"
 
 
+def llm_evidence(snapshot: dict, previous: dict | None) -> dict:
+    """Build a second, narrow allowlist for data allowed to leave this host.
+
+    Do not pass rendered reports: they contain local identifiers and paths.
+    All strings below are constants or validated closed-vocabulary labels.
+    """
+    source_service = snapshot.get("service") or {}
+    service = {}
+    for key, vocabulary in (("ActiveState", ACTIVE_STATES),
+                            ("SubState", SUB_STATES), ("Result", RESULTS)):
+        value = source_service.get(key)
+        if isinstance(value, str) and value in vocabulary:
+            service[key] = value
+    for key in ("ExecMainCode", "ExecMainStatus"):
+        if number(source_service.get(key)) is not None:
+            service[key] = source_service[key]
+    status, explanation = service_status(service)
+    memory = snapshot.get("memory") or {}
+    evidence = {
+        "service_status": status,
+        "service_observation": explanation,
+        "systemd": service,
+        "stage": None,
+        "comparison": {"status": "unavailable"},
+        "resources_bytes": {
+            "root_free": number(snapshot.get("root_free")),
+            "data_free": number(snapshot.get("data_free")),
+            "host_memory_available": number(memory.get("MemAvailable")),
+            "host_memory_total": number(memory.get("MemTotal")),
+            "service_memory": number(source_service.get("MemoryCurrent")),
+        },
+        "collection_incomplete": bool(snapshot.get("warnings")),
+        "overall_completion_verified": False,
+        "api_availability_verified": False,
+    }
+    event = snapshot.get("event") or {}
+    stage, event_type, step = event.get("stage"), event.get("event"), event.get("step")
+    if not isinstance(stage, str) or stage not in STAGES:
+        return evidence
+    observed = parse_stamp(snapshot.get("observed_at"))
+    logged = parse_stamp(event.get("logged_at"))
+    age = (observed - logged).total_seconds() if observed and logged else -1
+    evidence["stage"] = {
+        "name": stage,
+        "event": event_type if isinstance(event_type, str) and event_type in EVENTS else None,
+        "step": step if isinstance(step, str) and step in STEPS else None,
+        "freshness": "unknown" if age < 0 else "stale" if age > STALE_SECONDS else "recent",
+        "age_seconds": age if age >= 0 else None,
+        "idle_seconds": number(event.get("idle_seconds")),
+        "counters": {key: value for key in COUNTERS
+                     if (value := number(event.get(key))) is not None},
+    }
+    if stage == "recovery-rollback":
+        evidence["stage"]["meaning"] = (
+            "The database is undoing an interrupted transaction before recovery can proceed. "
+            "Falling remaining_rows indicates rollback progress, not resumed wrangling. "
+            "Slowness alone is not grounds to kill or restart it."
+        )
+    if not previous:
+        return evidence
+    invocation = source_service.get("InvocationID")
+    if (not isinstance(invocation, str) or not INVOCATION.fullmatch(invocation)
+            or invocation != previous.get("invocation")
+            or stage != previous.get("stage") or step != previous.get("step")):
+        evidence["comparison"] = {"status": "different_run_or_stage"}
+        return evidence
+    old_logged = parse_stamp(previous.get("logged_at"))
+    if not logged or not old_logged or logged <= old_logged:
+        evidence["comparison"] = {"status": "no_newer_observation"}
+        return evidence
+    old_counters = previous.get("counters") or {}
+    deltas = {}
+    for key, value in evidence["stage"]["counters"].items():
+        old = number(old_counters.get(key))
+        if old is not None:
+            deltas[key] = value - old
+    evidence["comparison"] = {
+        "status": "same_run_and_stage" if deltas else "no_shared_counters",
+        "observation_interval_seconds": (logged - old_logged).total_seconds(),
+        "counter_changes": deltas,
+    }
+    return evidence
+
+
+def ai_assessment(snapshot: dict, previous: dict | None, state_file: Path) -> str:
+    if os.environ.get("OJS_PROGRESS_LLM_ENABLED") != "1":
+        raise progress_llm.SummaryUnavailable()
+    directory = os.environ.get("CREDENTIALS_DIRECTORY")
+    if not directory:
+        raise progress_llm.SummaryUnavailable()
+    return progress_llm.generate_summary(
+        llm_evidence(snapshot, previous),
+        credential_path=Path(directory) / "openai-api-key",
+        budget_path=state_file.parent / "llm-budget.json",
+    )
+
+
 def render_report(snapshot: dict, previous: dict | None = None) -> tuple[str, str]:
     service, event = snapshot["service"], snapshot.get("event")
     status, description = service_status(service)
@@ -505,7 +604,9 @@ def write_state(path: Path, state: dict) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dry-run", action="store_true", help="Print safe preview; do not read credentials, send, or write state.")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--dry-run", action="store_true", help="Print safe preview; do not read credentials, send, or write state.")
+    mode.add_argument("--preview-llm", action="store_true", help="Explicit paid AI preview; no email or delivery-state change; normal AI attempt caps apply.")
     parser.add_argument("--project-root", type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument("--state-file", type=Path, default=DEFAULT_STATE)
     parser.add_argument("--password-file", type=Path, help="Explicit credential path for manual use.")
@@ -518,6 +619,22 @@ def main(argv: list[str] | None = None) -> int:
             subject, body = render_report(snapshot, read_state(args.state_file))
             print("Subject: " + subject + "\n\n" + body, end="")
             return 0
+        if args.preview_llm:
+            with report_lock(args.state_file) as acquired:
+                if not acquired:
+                    print("AI preview unavailable: another report is in progress.", file=sys.stderr)
+                    return 1
+                try:
+                    summary = ai_assessment(collect_snapshot(args.project_root),
+                                            read_state(args.state_file), args.state_file)
+                except progress_llm.SummaryUnavailable as error:
+                    print(f"AI preview unavailable: {error}", file=sys.stderr)
+                    return 1
+                except Exception:
+                    print("AI preview unavailable; check private configuration, API access, or attempt limits.", file=sys.stderr)
+                    return 1
+                print("AI assessment (interpretation; exact figures remain in the factual report):\n" + summary)
+                return 0
         sender = email_address(os.environ.get("OJS_PROGRESS_EMAIL_FROM"))
         recipient = email_address(os.environ.get("OJS_PROGRESS_EMAIL_TO"))
         with report_lock(args.state_file) as acquired:
@@ -532,6 +649,18 @@ def main(argv: list[str] | None = None) -> int:
             snapshot = collect_snapshot(args.project_root)
             subject, body = render_report(snapshot, previous)
             password = read_password(args.password_file)
+            if os.environ.get("OJS_PROGRESS_LLM_ENABLED") == "1":
+                try:
+                    summary = ai_assessment(snapshot, previous, args.state_file)
+                    body = ("AI assessment (interpretation; verify against the observations below):\n"
+                            + summary + "\n\nRecorded observations\n\n" + body)
+                    print("AI assessment generated; factual observations retained.")
+                except progress_llm.SummaryUnavailable as error:
+                    body = "AI assessment unavailable; factual report follows.\n\n" + body
+                    print(f"AI assessment unavailable; sending factual report. {error}")
+                except Exception:
+                    body = "AI assessment unavailable; factual report follows.\n\n" + body
+                    print("AI assessment unavailable; sending factual report.")
             send_email(sender, recipient, password, subject, body)
             accepted = True
             write_state(args.state_file, comparable_state(snapshot, utc_now()))
