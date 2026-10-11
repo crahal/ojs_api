@@ -446,6 +446,25 @@ class CompactUpdateTests(unittest.TestCase):
         self.assertFalse(self.runner.commands)
         self.assertFalse(self.runner.children)
 
+    def test_capacity_guards_both_data_and_external_scratch(self):
+        scratch = self.root / "dedicated-mysql-scratch"
+        scratch.mkdir()
+        self.coordinator.env["OJS_MYSQL_TMP_ROOT"] = str(scratch)
+        with mock.patch.object(update.shutil, "disk_usage", side_effect=[
+            mock.Mock(free=100 * update.GIB), mock.Mock(free=7 * update.GIB),
+        ]) as usage:
+            with self.assertRaisesRegex(update.UpdateError, "MySQL scratch"):
+                self.coordinator.capacity(8)
+        self.assertEqual([call.args[0] for call in usage.call_args_list], [self.clean, scratch])
+
+    def test_scratch_free_space_cannot_hide_a_full_data_disk(self):
+        scratch = self.root / "dedicated-mysql-scratch"
+        scratch.mkdir()
+        self.coordinator.env["OJS_MYSQL_TMP_ROOT"] = str(scratch)
+        with mock.patch.object(update.shutil, "disk_usage", return_value=mock.Mock(free=7 * update.GIB)):
+            with self.assertRaisesRegex(update.UpdateError, "on data"):
+                self.coordinator.capacity(8)
+
     def test_finalizing_candidate_blocks_download_without_discarding_work(self):
         self.args.publish_only = False
         staging = self.clean / "mysql-2026-01-01.building"

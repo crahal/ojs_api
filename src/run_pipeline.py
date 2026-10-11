@@ -627,6 +627,45 @@ class RawRecordsDDL:
             raise PipelineError("no complete records table declaration found for compression")
 
 
+def mysql_scratch_root(
+    datadir: Path | None = None, *, configured: str | None = None,
+) -> Path | None:
+    """Validate the optional, pre-provisioned root for ephemeral MySQL files."""
+    value = os.environ.get("OJS_MYSQL_TMP_ROOT", "") if configured is None else configured
+    if not value:
+        return None
+    root = Path(value)
+    if (not root.is_absolute() or ".." in root.parts
+            or any(character in value for character in (":", "\n", "\r", "\0"))):
+        raise PipelineError("OJS_MYSQL_TMP_ROOT must be a single absolute dedicated directory")
+    if any(path.is_symlink() for path in (root, *root.parents)):
+        raise PipelineError("OJS_MYSQL_TMP_ROOT must not contain symlinks")
+    try:
+        root = root.resolve(strict=True)
+    except OSError as exc:
+        raise PipelineError("OJS_MYSQL_TMP_ROOT must already exist as a dedicated directory") from exc
+    broad_roots = {
+        Path(value) for value in ("/", "/home", "/srv", "/mnt", "/media", "/opt",
+                                 "/tmp", "/var", "/var/tmp", "/var/lib", "/var/cache")
+    }
+    system_roots = tuple(Path(value) for value in (
+        "/bin", "/boot", "/dev", "/etc", "/lib", "/lib64", "/proc", "/root",
+        "/run", "/sbin", "/sys", "/usr", "/var/log", "/var/spool",
+    ))
+    protected = (PROJECT_ROOT, DEFAULT_RAW_DIR, DEFAULT_CLEAN_DIR)
+    if (root in broad_roots or {"data", "raw", "clean"}.intersection(root.parts)
+            or any(root.is_relative_to(path) for path in system_roots)
+            or any(path.is_relative_to(root) for path in protected)):
+        raise PipelineError("OJS_MYSQL_TMP_ROOT must not be a system, project, or data directory")
+    if datadir is not None:
+        data = datadir.resolve()
+        if root.is_relative_to(data) or data.is_relative_to(root):
+            raise PipelineError("OJS_MYSQL_TMP_ROOT must be separate from the MySQL datadir")
+    if not root.is_dir():
+        raise PipelineError("OJS_MYSQL_TMP_ROOT must already exist as a dedicated directory")
+    return root
+
+
 class MySQLServer:
     def __init__(
         self,
@@ -640,6 +679,12 @@ class MySQLServer:
         self.datadir = datadir.resolve()
         self.buffer_pool_size = buffer_pool_size
         self.compact_storage = compact_storage
+        self.scratch_root = mysql_scratch_root(self.datadir)
+        self._scratch_dir: Path | None = None
+        self._scratch_identity: tuple[int, int] | None = None
+        self._scratch_marker: str | None = None
+        self._scratch_failed = False
+        self.innodb_tmp: Path | None = None
         self.runtime = tempfile.TemporaryDirectory(prefix="ojs-api-mysql-")
         runtime_path = Path(self.runtime.name)
         self.socket = runtime_path / "mysql.sock"
@@ -839,8 +884,62 @@ class MySQLServer:
             error = command_error("MySQL initialization", result)
             raise error
 
+    def _prepare_disk_tmp(self) -> None:
+        if self.scratch_root is None:
+            self.disk_tmp.mkdir(parents=True, exist_ok=True)
+            return
+        if self._scratch_failed or self._scratch_dir is not None:
+            raise PipelineError("MySQL scratch already allocated; working files retained")
+        root = mysql_scratch_root(self.datadir, configured=str(self.scratch_root))
+        digest = hashlib.sha256(os.fsencode(self.datadir)).hexdigest()[:16]
+        self._scratch_dir = Path(tempfile.mkdtemp(prefix=f"ojs-mysql-{digest}-", dir=root))
+        info = self._scratch_dir.stat()
+        self._scratch_identity = (info.st_dev, info.st_ino)
+        self._scratch_marker = json.dumps({
+            "schema_version": 1, "datadir": str(self.datadir),
+            "instance": self._scratch_dir.name,
+        }, sort_keys=True) + "\n"
+        (self._scratch_dir / ".ojs-mysql-scratch.json").write_text(
+            self._scratch_marker, encoding="utf-8",
+        )
+        self.disk_tmp = self._scratch_dir / "tmp"
+        self.innodb_tmp = self._scratch_dir / "innodb"
+        self.disk_tmp.mkdir()
+        self.innodb_tmp.mkdir()
+
+    def _cleanup_disk_tmp(self) -> None:
+        if self.scratch_root is None:
+            shutil.rmtree(self.disk_tmp, ignore_errors=True)
+            return
+        if self._scratch_dir is None or self._scratch_failed:
+            return
+        root = mysql_scratch_root(self.datadir, configured=str(self.scratch_root))
+        scratch = self._scratch_dir
+        marker = scratch / ".ojs-mysql-scratch.json"
+        try:
+            info = scratch.lstat()
+            owned = (
+                scratch.parent == root and not scratch.is_symlink()
+                and (info.st_dev, info.st_ino) == self._scratch_identity
+                and not marker.is_symlink()
+                and marker.read_text(encoding="utf-8") == self._scratch_marker
+            )
+        except (OSError, UnicodeError):
+            owned = False
+        if not owned:
+            raise PipelineError("MySQL scratch ownership changed; working files retained")
+        shutil.rmtree(scratch)
+        self._scratch_dir = None
+
     def start(self, password: str | None) -> None:
-        self.disk_tmp.mkdir(parents=True, exist_ok=True)
+        try:
+            self._prepare_disk_tmp()
+            self._start(password)
+        except BaseException:
+            self._scratch_failed = True
+            raise
+
+    def _start(self, password: str | None) -> None:
         max_connections = os.environ.get(
             "OJS_BUILDER_MYSQL_MAX_CONNECTIONS",
             "8",
@@ -859,6 +958,8 @@ class MySQLServer:
                 f"--pid-file={self.pid_file}",
                 f"--log-error={self.server_log}",
                 f"--tmpdir={self.disk_tmp}",
+                *([f"--innodb-temp-tablespaces-dir={self.innodb_tmp}"]
+                  if self.innodb_tmp is not None else []),
                 f"--innodb-buffer-pool-size={self.buffer_pool_size}",
                 f"--max-connections={max_connections}",
                 f"--temptable-max-ram={temptable_max_ram}",
@@ -877,7 +978,8 @@ class MySQLServer:
             label="mysql-start",
         )
         if result.returncode != 0:
-            shutil.rmtree(self.disk_tmp, ignore_errors=True)
+            if self.scratch_root is None:
+                shutil.rmtree(self.disk_tmp, ignore_errors=True)
             error = command_error("MySQL startup", result)
             raise error
         self.running = True
@@ -1101,9 +1203,16 @@ class MySQLServer:
                 process.stdout.close()
 
     def shutdown(self, password: str | None) -> None:
+        try:
+            self._shutdown(password)
+        except BaseException:
+            self._scratch_failed = True
+            raise
+
+    def _shutdown(self, password: str | None) -> None:
         self.cancel_clients()
         if not self.running and not self.pid_file.exists():
-            shutil.rmtree(self.disk_tmp, ignore_errors=True)
+            self._cleanup_disk_tmp()
             self.runtime.cleanup()
             return
         result = self._run_control(
@@ -1117,6 +1226,8 @@ class MySQLServer:
             ],
             label="mysql-shutdown", password=password, allow_failure=True,
         )
+        if result.returncode != 0:
+            self._scratch_failed = True
         if result.returncode != 0 and self.pid_file.exists():
             try:
                 pid = int(self.pid_file.read_text(encoding="ascii").strip())
@@ -1143,7 +1254,7 @@ class MySQLServer:
                     raise PipelineError("MySQL exited without removing its PID file; unclean working files retained") from None
                 time.sleep(0.5)
         self.running = False
-        shutil.rmtree(self.disk_tmp, ignore_errors=True)
+        self._cleanup_disk_tmp()
         self.runtime.cleanup()
 
 

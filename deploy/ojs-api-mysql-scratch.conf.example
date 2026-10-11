@@ -1,0 +1,9 @@
+# Optional: install after creating /srv/ojs-mysql-tmp owned by ojs (mode 700)
+# and installing the checked-in AppArmor rules. This directory is dedicated to
+# temporary SQL work, not source archives, exports or persistent MySQL tables.
+[Unit]
+RequiresMountsFor=/srv/ojs-mysql-tmp
+
+[Service]
+Environment=OJS_MYSQL_TMP_ROOT=/srv/ojs-mysql-tmp
+ReadWritePaths=/srv/ojs-mysql-tmp

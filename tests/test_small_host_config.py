@@ -82,6 +82,14 @@ class SmallHostConfigTest(unittest.TestCase):
         self.assertIn("\nTimeoutStopSec=infinity\n", override)
         self.assertNotIn("--force-rebuild", override)
 
+    def test_optional_scratch_has_matching_systemd_and_apparmor_paths(self):
+        override = (PROJECT_ROOT / "deploy/ojs-api-mysql-scratch.conf.example").read_text()
+        rules = (PROJECT_ROOT / "deploy/apparmor-mysqld-ojs").read_text()
+        self.assertIn("Environment=OJS_MYSQL_TMP_ROOT=/srv/ojs-mysql-tmp", override)
+        self.assertIn("ReadWritePaths=/srv/ojs-mysql-tmp", override)
+        self.assertIn("RequiresMountsFor=/srv/ojs-mysql-tmp", override)
+        self.assertIn("/srv/ojs-mysql-tmp/** rwk,", rules)
+
 
 if __name__ == "__main__":
     unittest.main()

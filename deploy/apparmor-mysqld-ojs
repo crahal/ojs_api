@@ -3,5 +3,8 @@
 # the pipeline's private runtime directories; do not disable the whole profile.
 /srv/ojs_api/data/ rw,
 /srv/ojs_api/data/** rwk,
+# Optional dedicated SQL and InnoDB session temporary storage; not raw data.
+/srv/ojs-mysql-tmp/ rw,
+/srv/ojs-mysql-tmp/** rwk,
 /tmp/ojs-api-mysql-*/ rw,
 /tmp/ojs-api-mysql-*/** rwk,

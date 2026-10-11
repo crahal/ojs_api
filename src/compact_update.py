@@ -263,10 +263,17 @@ class Coordinator:
 
     def capacity(self, minimum: float) -> None:
         path = self.clean if self.clean.exists() else self.root
-        free = shutil.disk_usage(path).free
-        if free < minimum * GIB:
-            raise UpdateError(f"disk reserve reached: {free / GIB:.1f} GiB free; "
-                              f"{minimum:g} GiB required; live database retained")
+        paths = [("data", path)]
+        scratch = run_pipeline.mysql_scratch_root(
+            configured=self.env.get("OJS_MYSQL_TMP_ROOT", ""),
+        )
+        if scratch is not None:
+            paths.append(("MySQL scratch", scratch))
+        for label, directory in paths:
+            free = shutil.disk_usage(directory).free
+            if free < minimum * GIB:
+                raise UpdateError(f"disk reserve reached on {label}: {free / GIB:.1f} GiB free; "
+                                  f"{minimum:g} GiB required; existing database files retained")
 
     def memory_capacity(self) -> None:
         minimum_mb = int(self.env.get("OJS_MIN_AVAILABLE_MEMORY_MB", "512"))

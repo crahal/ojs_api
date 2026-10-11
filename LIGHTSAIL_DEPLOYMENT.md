@@ -455,14 +455,46 @@ temporary tablespace**, `#innodb_temp/temp_10.ibt`. MySQL recreates that pool on
 startup; these `.ibt` files are not persistent `.ibd` tables or rollback logs.
 An isolated MySQL crash-recovery test verified that removing only this kind of
 session file preserves committed data/checkpoints and allows normal rollback.
-For this incident, the exact offline file is being quarantined on the existing
-root disk, byte-compared and synced before its old copy is removed, while
-holding the source and pipeline locks. The recoverable location is
+For this incident, the exact offline file was quarantined on the existing
+root disk, byte-compared and synced before its old copy was removed, while
+holding the source and pipeline locks. This restored approximately 16.2 GiB on
+the data filesystem without removing persistent data. The recoverable location is
 `/srv/ojs-recovery-quarantine/january-temp_10.ibt`; all archives remain in place.
 Keep the quarantine until successful recovery is verified, then remove that
 specific obsolete temporary copy deliberately. This is an incident-specific
 operation, not permission to delete arbitrary MySQL files or lower the guard.
 [MySQL temporary-tablespace lifecycle](https://dev.mysql.com/doc/refman/8.4/en/innodb-temporary-tablespace.html).
+
+#### Optional temporary SQL workspace on the existing root disk
+
+When `/` has measured spare capacity, set `OJS_MYSQL_TMP_ROOT` to a dedicated
+directory there. This routes both MySQL `tmpdir` and InnoDB session temporary
+tablespaces to isolated, ownership-marked per-run children; persistent tables,
+undo/redo and source archives stay on the data volume. It does not buy storage
+or guarantee that the complete build fits. The coordinator enforces its
+20 GiB starting floor and 8 GiB operating reserve on **each filesystem**, not
+their combined free space. Inspect both with `df -h / /srv/ojs_api/data`.
+
+Only provision this while the update service and its MySQL are stopped, after
+reviewing the free space and existing AppArmor local rules. For this layout:
+
+```bash
+cd /srv/ojs_api
+sudo install -d -o ojs -g ojs -m 700 /srv/ojs-mysql-tmp
+# Merge rather than overwrite if this file contains additional custom rules.
+sudo install -o root -g root -m 644 deploy/apparmor-mysqld-ojs /etc/apparmor.d/local/usr.sbin.mysqld
+sudo apparmor_parser -r /etc/apparmor.d/usr.sbin.mysqld
+sudo install -d -m 755 /etc/systemd/system/ojs-api-update.service.d
+sudo install -o root -g root -m 644 deploy/ojs-api-mysql-scratch.conf.example /etc/systemd/system/ojs-api-update.service.d/30-mysql-scratch.conf
+sudo systemctl daemon-reload
+```
+
+The scratch drop-in supplies the environment variable, writable path and mount
+dependency together. Do not give `.env` a conflicting `OJS_MYSQL_TMP_ROOT`.
+Direct, non-systemd runs need this variable supplied explicitly. Never choose
+`/`, `/tmp`, an archive directory or a persistent MySQL datadir as the scratch
+root. Successful shutdown removes only that process's owned child; failures
+retain it for inspection, so check for leftovers before a later attempt.
 
 After capacity and the stopped candidate have been reviewed, install the tested
 code and the updated service. The service now uses `KillMode=mixed` and
