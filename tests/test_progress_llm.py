@@ -260,6 +260,8 @@ class RequestTests(unittest.TestCase):
         self.assertLessEqual(len(decoded["instructions"].encode()) + len(decoded["input"].encode()), 8192)
         self.assertEqual(json.loads(decoded["input"]), EVIDENCE)
         self.assertNotIn(SECRET, payload.decode())
+        self.assertIn("Overall recovery and API availability remain unverified.", decoded["instructions"])
+        self.assertIn("even in negations", decoded["instructions"])
 
     def https_fixture(self, *, code=200, body=None, headers=None):
         connection = mock.Mock()

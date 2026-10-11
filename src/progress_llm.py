@@ -43,7 +43,9 @@ INSTRUCTIONS = (
     "is stale, missing, or not comparable. Only discuss counter changes when the supplied "
     "comparison explicitly establishes the same invocation and stage. "
     "Leave exact counters to the separate factual report. Do not use Markdown. "
-    "For uncertainty, prefer: Overall recovery and API availability remain unverified."
+    "When discussing the overall outcome, use exactly: Overall recovery and API availability remain unverified. "
+    "Do not use any of these words, even in negations or quoted labels: complete, completed, "
+    "finished, done, succeeded, successful, successfully, healthy, normal, normally."
 )
 _KEY = re.compile(r"sk-[A-Za-z0-9_-]{16,509}\Z")
 _BUDGET_KEYS = frozenset({"schema", "day", "month", "day_attempts", "month_attempts", "last_attempt_at"})
