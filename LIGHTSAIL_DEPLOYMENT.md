@@ -383,7 +383,7 @@ API. `--dry-run` prints the report without credentials, sending mail, or writing
 reporter state, so it can be checked during recovery:
 
 ```bash
-sudo -u ojs -g systemd-journal python3 -B /srv/ojs_api/src/email_progress.py --dry-run
+sudo runuser -u ojs -g systemd-journal -- python3 -B /srv/ojs_api/src/email_progress.py --dry-run
 ```
 
 The sender needs Google 2-Step Verification and a dedicated
