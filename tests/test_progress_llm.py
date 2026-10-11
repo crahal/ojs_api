@@ -78,26 +78,55 @@ class BudgetTests(unittest.TestCase):
                 network.assert_not_called()
                 self.assertFalse(self.budget.exists())
 
-    def test_third_utc_day_attempt_is_rejected_without_reset_or_network(self):
+    def test_eleventh_utc_day_attempt_is_rejected_without_reset_or_network(self):
+        self.assertEqual(llm.DAILY_ATTEMPTS, 10)
         with mock.patch.object(llm, "_bounded_request", return_value=response()) as network:
-            self.generate()
-            self.generate(now=NOW + timedelta(seconds=1))
+            for offset in range(llm.DAILY_ATTEMPTS):
+                self.generate(now=NOW + timedelta(seconds=offset))
             before = self.budget.read_bytes()
             with self.assertRaises(llm.SummaryUnavailable) as raised:
-                self.generate(now=NOW + timedelta(seconds=2))
+                self.generate(now=NOW + timedelta(seconds=llm.DAILY_ATTEMPTS))
             self.assertEqual(raised.exception.reason, "daily_limit")
-        self.assertEqual(network.call_count, 2)
+        self.assertEqual(network.call_count, llm.DAILY_ATTEMPTS)
         self.assertEqual(self.budget.read_bytes(), before)
 
     def test_failed_network_and_invalid_output_attempts_still_count(self):
-        with mock.patch.object(llm, "_bounded_request", side_effect=[OSError(SECRET), response(status="incomplete")]) as network:
-            for offset in range(3):
+        failures = [OSError(SECRET) if offset % 2 == 0 else response(status="incomplete")
+                    for offset in range(llm.DAILY_ATTEMPTS)]
+        with mock.patch.object(llm, "_bounded_request", side_effect=failures) as network:
+            for offset in range(llm.DAILY_ATTEMPTS):
                 with self.assertRaises(llm.SummaryUnavailable) as raised:
                     self.generate(now=NOW + timedelta(seconds=offset))
                 self.assertSafe(raised.exception)
-        self.assertEqual(network.call_count, 2)
+                self.assertEqual(raised.exception.reason,
+                                 "network_or_api" if offset % 2 == 0 else "output_incomplete")
+            before = self.budget.read_bytes()
+            with self.assertRaises(llm.SummaryUnavailable) as raised:
+                self.generate(now=NOW + timedelta(seconds=llm.DAILY_ATTEMPTS))
+            self.assertEqual(raised.exception.reason, "daily_limit")
+        self.assertEqual(network.call_count, llm.DAILY_ATTEMPTS)
+        self.assertEqual(self.budget.read_bytes(), before)
         budget = json.loads(self.budget.read_text())
-        self.assertEqual((budget["day_attempts"], budget["month_attempts"]), (2, 2))
+        self.assertEqual((budget["day_attempts"], budget["month_attempts"]),
+                         (llm.DAILY_ATTEMPTS, llm.DAILY_ATTEMPTS))
+
+    def test_existing_two_attempt_budget_is_preserved_and_advances_to_three(self):
+        previous = {"schema": 1, "day": "2026-10-11", "month": "2026-10",
+                    "day_attempts": 2, "month_attempts": 2,
+                    "last_attempt_at": NOW.isoformat(timespec="microseconds")}
+        llm._save_budget(self.budget, previous)
+        next_attempt = NOW + timedelta(seconds=1)
+
+        def network(payload, key):
+            reserved = json.loads(self.budget.read_text())
+            self.assertEqual(reserved, {**previous, "day_attempts": 3, "month_attempts": 3,
+                                       "last_attempt_at": next_attempt.isoformat(timespec="microseconds")})
+            return response()
+
+        with mock.patch.object(llm, "_bounded_request", side_effect=network) as request:
+            self.assertEqual(self.generate(now=next_attempt), TEXT)
+        request.assert_called_once()
+        self.assertEqual(json.loads(self.budget.read_text())["month_attempts"], 3)
 
     def test_output_failure_keeps_specific_safe_reason_without_retry(self):
         with mock.patch.object(llm, "_bounded_request", return_value=response(status="incomplete")) as network:
@@ -110,16 +139,17 @@ class BudgetTests(unittest.TestCase):
 
     def test_daily_rollover_keeps_monthly_count(self):
         with mock.patch.object(llm, "_bounded_request", return_value=response()):
-            self.generate()
-            self.generate(now=NOW + timedelta(seconds=1))
+            for offset in range(llm.DAILY_ATTEMPTS):
+                self.generate(now=NOW + timedelta(seconds=offset))
             self.generate(now=NOW + timedelta(days=1))
         budget = json.loads(self.budget.read_text())
-        self.assertEqual((budget["day_attempts"], budget["month_attempts"]), (1, 3))
+        self.assertEqual((budget["day_attempts"], budget["month_attempts"]), (1, llm.DAILY_ATTEMPTS + 1))
 
     def test_monthly_cap_rejects_new_day_and_new_month_can_start(self):
+        self.assertEqual(llm.MONTHLY_ATTEMPTS, 65)
         llm._reserve_attempt(self.budget, NOW)
         budget = json.loads(self.budget.read_text())
-        budget["month_attempts"] = 65
+        budget["month_attempts"] = llm.MONTHLY_ATTEMPTS
         self.budget.write_text(json.dumps(budget))
         with mock.patch.object(llm, "_bounded_request", return_value=response()) as network:
             with self.assertRaises(llm.SummaryUnavailable) as raised:
@@ -145,8 +175,11 @@ class BudgetTests(unittest.TestCase):
         llm._reserve_attempt(self.budget, NOW)
         valid = json.loads(self.budget.read_text())
         cases = [b"", b"not JSON", b"{}", b"[]", b"x" * (llm.MAX_BUDGET_BYTES + 1)]
-        for changes in ({"schema": True}, {"day_attempts": 0}, {"day_attempts": 3},
-                        {"day_attempts": True}, {"month_attempts": 66}, {"month_attempts": 0},
+        for changes in ({"schema": True}, {"day_attempts": 0},
+                        {"day_attempts": llm.DAILY_ATTEMPTS + 1, "month_attempts": llm.DAILY_ATTEMPTS + 1},
+                        {"day_attempts": 2, "month_attempts": 1},
+                        {"day_attempts": True}, {"month_attempts": llm.MONTHLY_ATTEMPTS + 1},
+                        {"month_attempts": 0},
                         {"day": "2026-13-99"}, {"month": "2026-09"},
                         {"last_attempt_at": "2026-10-11T12:00:00"},
                         {"last_attempt_at": "2026-10-10T12:00:00+00:00"}, {"secret": SECRET}):
@@ -316,6 +349,27 @@ class RequestTests(unittest.TestCase):
 
 
 class OutputTests(unittest.TestCase):
+    def test_all_content_failures_have_closed_diagnostics_without_response_text(self):
+        text = "Recovery is complete in two hours. Restart at https://private.example.org/" + SECRET + "/123."
+        with self.assertRaises(llm.SummaryUnavailable) as raised:
+            llm._summary(response(text))
+        error = raised.exception
+        self.assertEqual(error.reason, "output_content")
+        self.assertTrue({"status_complete", "word_two", "word_hours", "word_restart", "link", "numeric_characters"}
+                        .issubset(error.checks))
+        self.assertTrue(set(error.checks).issubset(llm._CONTENT_CHECKS))
+        for private in (SECRET, "private.example.org", "123", text):
+            self.assertNotIn(private, str(error))
+
+    def test_diagnostic_constructor_ignores_arbitrary_checks(self):
+        for checks in (SECRET, {SECRET: True}, [SECRET, "word_two", {}, "word_two"]):
+            error = llm.SummaryUnavailable("output_content", checks=checks)
+            self.assertNotIn(SECRET, str(error))
+            self.assertTrue(set(error.checks).issubset(llm._CONTENT_CHECKS))
+        self.assertEqual(llm.SummaryUnavailable("output_content", checks=["word_two", "word_two"]).checks,
+                         ("word_two",))
+        self.assertFalse(llm.SummaryUnavailable("authentication", checks=["word_two"]).checks)
+
     def test_short_plain_completed_summary_is_accepted(self):
         self.assertEqual(llm._summary(response()), TEXT)
 

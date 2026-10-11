@@ -28,7 +28,7 @@ REQUEST_SECONDS = 30.0
 MAX_RESPONSE_BYTES = 64 * 1024
 MAX_INPUT_BYTES = 8192
 MAX_BUDGET_BYTES = 2048
-DAILY_ATTEMPTS = 2
+DAILY_ATTEMPTS = 10
 MONTHLY_ATTEMPTS = 65
 INSTRUCTIONS = (
     "Write a cautious, plain-English interpretation of the supplied recovery observations. "
@@ -62,18 +62,22 @@ ERROR_MESSAGES = {
     "output_style": "AI response exceeded the short plain-text format; use the factual report.",
     "output_content": "AI response contained disallowed content or an unverified claim; use the factual report.",
 }
-_UNSUITABLE = re.compile(
-    r"https?\b|www\.|://|@|\b[a-z][a-z.-]*\.(?:com|org|net|io|edu|gov|uk|dev)\b"
-    r"|\bdrop\s+(?:(?:the|a|this|that|your|all|if|exists)\s+){0,3}"
-    r"(?:databases?|tables?|indexes?|schemas?|users?|roles?|jobs?|processes?|services?|files?|directories|data|archives?)\b"
-    r"|\b(?:sudo|systemctl|mysqladmin|mysqld|curl|wget|kill|restart|reboot|delete|"
-    r"truncate|chmod|chown|ssh|rm|eta|percent|percentage|tomorrow|tonight|"
-    r"hour|hours|minute|minutes|day|days|week|weeks|zero|one|two|three|four|five|"
-    r"six|seven|eight|nine|ten|hundred|thousand|million|billion|trillion)\b",
-    re.IGNORECASE,
-)
+_LINK = re.compile(r"https?\b|www\.|://|@|\b[a-z][a-z.-]*\.(?:com|org|net|io|edu|gov|uk|dev)\b", re.IGNORECASE)
+_DROP_COMMAND = re.compile(
+    r"\bdrop\s+(?:(?:the|a|this|that|your|all|if|exists)\s+){0,3}"
+    r"(?:databases?|tables?|indexes?|schemas?|users?|roles?|jobs?|processes?|services?|files?|directories|data|archives?)\b",
+    re.IGNORECASE)
+_RESTRICTED_WORDS = (
+    "sudo systemctl mysqladmin mysqld curl wget kill restart reboot delete truncate chmod chown ssh rm "
+    "eta percent percentage tomorrow tonight hour hours minute minutes day days week weeks "
+    "zero one two three four five six seven eight nine ten hundred thousand million billion trillion"
+).split()
 _STATUS_WORDS = r"healthy|normal|normally|succeeded|successful|successfully|done|finished|complete|completed"
-_STATUS_CLAIM = re.compile(rf"\b(?:{_STATUS_WORDS})\b", re.IGNORECASE)
+_CONTENT_CHECKS = frozenset(
+    ["control_characters", "numeric_characters", "markup", "link", "drop_command"]
+    + ["word_" + word for word in _RESTRICTED_WORDS]
+    + ["status_" + word for word in _STATUS_WORDS.split("|")]
+)
 # These are deliberately narrow language checks, not a semantic verifier.
 # A cautious denial such as 'does not mean recovery is complete' is not a
 # positive completion claim. Never let its scope cross a sentence or contrast.
@@ -92,10 +96,39 @@ _UNCERTAIN_STATUS = re.compile(
 class SummaryUnavailable(Exception):
     """Safe to log; never incorporates credentials, response bodies or errors."""
 
-    def __init__(self, reason: str = "unavailable"):
+    def __init__(self, reason: str = "unavailable", *, checks=()):
         self.reason = reason if isinstance(reason, str) and reason in ERROR_MESSAGES else "unavailable"
         self.code = self.reason
-        super().__init__(ERROR_MESSAGES[self.reason])
+        self.checks = tuple(sorted({check for check in checks[:len(_CONTENT_CHECKS)]
+                                   if isinstance(check, str) and check in _CONTENT_CHECKS})) \
+            if isinstance(checks, (tuple, list)) and self.reason == "output_content" else ()
+        detail = " Checks: " + ", ".join(self.checks) + "." if self.checks else ""
+        super().__init__(ERROR_MESSAGES[self.reason] + detail)
+
+
+def _content_checks(raw: str) -> tuple[str, ...]:
+    """Return all fixed rule IDs, never matched text, numbers or URLs."""
+    checks = []
+    if any(unicodedata.category(character).startswith("C") and character not in "\t\r\n"
+           for character in raw):
+        checks.append("control_characters")
+    text = " ".join(raw.split())
+    if any(character.isnumeric() for character in text):
+        checks.append("numeric_characters")
+    if any(character in text for character in "`<>[]{}#%*"):
+        checks.append("markup")
+    if _LINK.search(text):
+        checks.append("link")
+    if _DROP_COMMAND.search(text):
+        checks.append("drop_command")
+    for word in _RESTRICTED_WORDS:
+        if re.search(rf"\b{word}\b", text, re.IGNORECASE):
+            checks.append("word_" + word)
+    claims = _NEGATED_STATUS.sub("", _UNCERTAIN_STATUS.sub("", text))
+    for word in _STATUS_WORDS.split("|"):
+        if re.search(rf"\b{word}\b", claims, re.IGNORECASE):
+            checks.append("status_" + word)
+    return tuple(sorted(checks))
 
 
 def utc_now() -> datetime:
@@ -323,18 +356,13 @@ def _summary(encoded: bytes) -> str:
     text = " ".join(fragments)
     if not text or len(text) > 4096:
         raise SummaryUnavailable("output_style")
-    if any(unicodedata.category(character).startswith("C") and character not in "\t\r\n"
-           for character in text):
-        raise SummaryUnavailable("output_content")
+    checks = _content_checks(text)
     # Ordinary line breaks/tabs/spaces are formatting, not unsafe output.
     text = " ".join(text.split())
     if not text or len(text) > 1200 or len(text.split()) > 120:
         raise SummaryUnavailable("output_style")
-    claims = _NEGATED_STATUS.sub("", _UNCERTAIN_STATUS.sub("", text))
-    if (any(character.isnumeric() for character in text)
-            or any(character in text for character in "`<>[]{}#%*")
-            or _UNSUITABLE.search(text) or _STATUS_CLAIM.search(claims)):
-        raise SummaryUnavailable("output_content")
+    if checks:
+        raise SummaryUnavailable("output_content", checks=checks)
     sentences = re.findall(r"[.!?]+(?:\s+|$)", text)
     if not 2 <= len(sentences) <= 4 or not text.endswith((".", "!", "?")):
         raise SummaryUnavailable("output_style")
