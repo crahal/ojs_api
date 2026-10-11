@@ -1,0 +1,12 @@
+# Install only after inspecting a stopped bootstrap candidate and capacity.
+# Use a late-sorting drop-in name (zzzz-exact-key-recovery.conf). Remove only
+# that file after recovery is verified; leave data/.updates-paused until the
+# subsequent history build and capacity plan have been reviewed.
+[Service]
+Environment=OJS_RECOVERY_SNAPSHOT=2026-01-01
+ExecStart=
+ExecStart=/srv/ojs_api/scripts/automatic_update.sh --recover-exact-keys ${OJS_RECOVERY_SNAPSHOT}
+# Never run an existing post-publication/archive-cleanup hook after recovery.
+ExecStartPost=
+KillMode=mixed
+TimeoutStopSec=infinity

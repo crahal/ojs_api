@@ -74,6 +74,14 @@ class SmallHostConfigTest(unittest.TestCase):
         self.assertIn("\nTimeoutStopSec=infinity\n", service)
         self.assertIn("\nKillMode=mixed\n", service)
 
+    def test_recovery_dropin_clears_post_publication_cleanup(self):
+        override = (PROJECT_ROOT / "deploy/ojs-api-exact-key-recovery.conf.example").read_text()
+        self.assertIn("\nExecStart=\n", override)
+        self.assertIn("--recover-exact-keys ${OJS_RECOVERY_SNAPSHOT}", override)
+        self.assertIn("\nExecStartPost=\n", override)
+        self.assertIn("\nTimeoutStopSec=infinity\n", override)
+        self.assertNotIn("--force-rebuild", override)
+
 
 if __name__ == "__main__":
     unittest.main()

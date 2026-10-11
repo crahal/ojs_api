@@ -450,6 +450,20 @@ Establish headroom before recovery; do not lower the reserve, remove `.ibd` or
 undo/redo files, change the checkpoint phase, or buy storage automatically.
 Free space on `/` is not automatically available to the data filesystem.
 
+On inspection, this candidate also contained a 16.2 GiB crashed **session
+temporary tablespace**, `#innodb_temp/temp_10.ibt`. MySQL recreates that pool on
+startup; these `.ibt` files are not persistent `.ibd` tables or rollback logs.
+An isolated MySQL crash-recovery test verified that removing only this kind of
+session file preserves committed data/checkpoints and allows normal rollback.
+For this incident, the exact offline file is being quarantined on the existing
+root disk, byte-compared and synced before its old copy is removed, while
+holding the source and pipeline locks. The recoverable location is
+`/srv/ojs-recovery-quarantine/january-temp_10.ibt`; all archives remain in place.
+Keep the quarantine until successful recovery is verified, then remove that
+specific obsolete temporary copy deliberately. This is an incident-specific
+operation, not permission to delete arbitrary MySQL files or lower the guard.
+[MySQL temporary-tablespace lifecycle](https://dev.mysql.com/doc/refman/8.4/en/innodb-temporary-tablespace.html).
+
 After capacity and the stopped candidate have been reviewed, install the tested
 code and the updated service. The service now uses `KillMode=mixed` and
 `TimeoutStopSec=infinity`; the coordinator and MySQL shutdown wait with progress
@@ -457,17 +471,23 @@ instead of force-killing a rollback. Inspect `systemctl cat` for older drop-ins
 that override these settings. A forced kill or reboot is not a clean shutdown.
 [MySQL explains that background rollback can outlast startup](https://dev.mysql.com/doc/refman/8.4/en/innodb-recovery.html).
 
-Explicit recovery is invoked by replacing the update service's `ExecStart`
-temporarily with:
+Explicit recovery is invoked with the small checked-in
+`deploy/ojs-api-exact-key-recovery.conf.example` drop-in. It replaces `ExecStart`
+with one dated recovery and **clears `ExecStartPost`**, so a previously installed
+archive-cleanup hook cannot run after this non-publishing operation:
 
 ```ini
 [Service]
+Environment=OJS_RECOVERY_SNAPSHOT=2026-01-01
 ExecStart=
-ExecStart=/srv/ojs_api/scripts/automatic_update.sh --recover-exact-keys 2026-01-01
+ExecStart=/srv/ojs_api/scripts/automatic_update.sh --recover-exact-keys ${OJS_RECOVERY_SNAPSHOT}
+ExecStartPost=
+KillMode=mixed
+TimeoutStopSec=infinity
 ```
 
 Keep the pause marker and cron pause in place. Use a named drop-in such as
-`/etc/systemd/system/ojs-api-update.service.d/exact-key-recovery.conf`, reload
+`/etc/systemd/system/ojs-api-update.service.d/zzzz-exact-key-recovery.conf`, reload
 systemd, verify the effective unit, then start it with `--no-block`. Do not paste
 this as a blind restart while only 8 GiB is free.
 
