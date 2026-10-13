@@ -386,6 +386,26 @@ reporter state, so it can be checked during recovery:
 sudo runuser -u ojs -g systemd-journal -- python3 -B /srv/ojs_api/src/email_progress.py --dry-run
 ```
 
+Reports lead with the named work stage and what it does, followed by recent
+phase milestones, measured activity and exact counters. A separate bounded,
+current-run milestone query preserves phase changes that have scrolled out of
+the heartbeat tail. Old runs are never mixed with the current run. Detailed
+systemd fields remain below the readable summary.
+
+- `exact_keys` means building DOI, OAI, URL and fingerprint matching keys. A long
+  SQL statement can have no intermediate row counter. `idle_seconds` measures
+  time since the last reported counter/milestone, **not** CPU inactivity.
+- A CPU increase between recent observations of the same process is activity
+  evidence, not proof of rows processed or that the SQL statement has returned.
+- Audit range percentages describe only that scan, not the whole build; ranges
+  differ in cost. A completed audit scan does not establish final validation or
+  API readiness. There is still no defensible overall percentage or ETA.
+- A stage change is not a restarted job. `SubState=dead` means an inactive
+  service, not automatically a crash. The email service itself normally exits
+  after sending; its state is separate from `ojs-api-update.service`.
+- A stale heartbeat, missing counters and an explicit failed job are reported
+  separately. Silence alone is not labelled a dead restore.
+
 The sender needs Google 2-Step Verification and a dedicated
 [Gmail app password](https://support.google.com/accounts/answer/185833?hl=en).
 Some accounts do not offer app passwords. An existing Gmail connection in chat
@@ -454,8 +474,11 @@ no longer needed.
 
 #### Optional AI-written progress summary
 
-An optional OpenAI call adds a short interpretation above the measured facts in
-each Gmail report. The existing Gmail configuration and recovery job continue
+An optional OpenAI call adds a short interpretation after the measured summary
+and before technical details in each Gmail report. It receives fixed, readable
+stage meanings and sanitized activity/milestone evidence; raw systemd labels
+such as `dead` are translated locally instead of left for the model to diagnose.
+The existing Gmail configuration and recovery job continue
 unchanged. If generation fails or its local request allowance is exhausted, the
 reporter sends the ordinary factual report. The model cannot run commands or
 change the server; its interpretation is not evidence that recovery succeeded.

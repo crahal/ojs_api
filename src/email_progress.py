@@ -28,11 +28,22 @@ import tempfile
 import time
 
 import progress_llm
+from progress_observations import observed_activity, recent_milestones
+from progress_summary import overview, stage_info
 
 
 SERVICE = "ojs-api-update.service"
 DEFAULT_STATE = Path("/var/lib/ojs-api-report/last-sent.json")
 JOURNAL_LINES = 300
+MILESTONE_LINES = 128
+# A separate bounded, filtered tail retains phase transitions when hours of
+# heartbeats have pushed them out of the ordinary tail. Never read SQL content.
+MILESTONE_PATTERN = (
+    r'(?=.*"event"\s*:\s*"(?:started|completed|failed|sql-stage)")'
+    r'(?=.*"stage"\s*:\s*"(?:recovery-rollback|recovery-metadata-audit|'
+    r'temporal finalization phase|source-index phase|sql-import|'
+    r'update-build|update-recover-exact-keys)")'
+)
 STALE_SECONDS = 300
 MIN_SEND_INTERVAL_SECONDS = 11 * 60 * 60
 MAX_STATE_BYTES = 16 * 1024
@@ -225,10 +236,13 @@ def parse_events(output: str, invocation: str) -> list[dict]:
             step = payload.get("step")
             if isinstance(step, str) and step in STEPS:
                 safe["step"] = step
-            for key in (*COUNTERS, "elapsed_seconds", "idle_seconds"):
+            for key in (*COUNTERS, "elapsed_seconds", "idle_seconds", "process_cpu_seconds"):
                 value = number(payload.get(key))
                 if value is not None:
                     safe[key] = value
+            pid = payload.get("process_pid")
+            if isinstance(pid, int) and not isinstance(pid, bool) and 0 < pid < 2 ** 31:
+                safe["process_pid"] = pid
             events.append(safe)
         except (ValueError, OverflowError, OSError, RecursionError):
             continue
@@ -265,6 +279,7 @@ def host_memory() -> dict:
 
 def collect_snapshot(project_root: Path) -> dict:
     snapshot = {"observed_at": stamp(utc_now()), "service": {}, "event": None,
+                "milestones": [], "activity": {},
                 "warnings": [], "root_free": free_bytes(Path("/")),
                 "data_free": free_bytes(project_root / "data"), "memory": host_memory()}
     try:
@@ -284,11 +299,25 @@ def collect_snapshot(project_root: Path) -> dict:
             "--lines=" + str(JOURNAL_LINES), "_SYSTEMD_INVOCATION_ID=" + invocation,
         ])
         events = parse_events(output, invocation)
+        milestones = []
+        try:
+            milestone_output = diagnostic([
+                "journalctl", "--unit=" + SERVICE, "--no-pager", "--output=json",
+                "--output-fields=MESSAGE,_SYSTEMD_INVOCATION_ID,__REALTIME_TIMESTAMP",
+                "--lines=" + str(MILESTONE_LINES), "--grep=" + MILESTONE_PATTERN,
+                "_SYSTEMD_INVOCATION_ID=" + invocation,
+            ], timeout=10, limit=512 * 1024)
+            milestones = recent_milestones(parse_events(milestone_output, invocation))
+        except (OSError, subprocess.SubprocessError, ReportError):
+            snapshot["warnings"].append("Earlier phase milestones unavailable; recent observations retained.")
         # Do not combine an old run's journal with a new run's service state.
         latest_service = read_service()
         snapshot["service"] = latest_service
         if latest_service.get("InvocationID") == invocation:
             snapshot["event"] = select_event(events)
+            snapshot["milestones"] = milestones
+            snapshot["activity"] = observed_activity(
+                events, snapshot["event"], observed_at=stamp(utc_now()))
         else:
             snapshot["warnings"].append("Service invocation changed during collection; stage omitted.")
     except (OSError, subprocess.SubprocessError, ReportError):
@@ -302,12 +331,12 @@ def service_status(service: dict) -> tuple[str, str]:
     if active == "failed" or (active == "inactive" and result not in (None, "success")):
         return "Failed", "Systemd reports a service failure. Recovery completion is unverified."
     if active in {"active", "activating", "reloading", "refreshing"}:
-        return "Running", "The service is running or starting; this alone does not prove forward progress."
+        return "Running", "The recovery job is running; long-running oneshot jobs can remain in systemd's starting state."
     if active == "deactivating":
         return "Stopping", "The service is stopping; rollback or shutdown may still be running."
     if active == "inactive" and result == "success" and service.get("ExecMainCode") == 1:
         if service.get("ExecMainStatus") == 0:
-            return "Finished", "Systemd reports a successful service exit; recovery/data completion is unverified."
+            return "Job exited", "Systemd reports a successful service exit; recovery/data completion is unverified."
     if active == "inactive":
         return "Idle", "The service is inactive; no completed recovery is inferred."
     return "Unknown", "Current service status could not be established."
@@ -400,7 +429,9 @@ def llm_evidence(snapshot: dict, previous: dict | None) -> dict:
     evidence = {
         "service_status": status,
         "service_observation": explanation,
-        "systemd": service,
+        # Translate systemd locally: 'dead' means inactive, and 'success' on a
+        # running oneshot is not a pipeline outcome. Do not ask the model to
+        # infer process health from these raw implementation labels.
         "stage": None,
         "comparison": {"status": "unavailable"},
         "resources_bytes": {
@@ -431,19 +462,47 @@ def llm_evidence(snapshot: dict, previous: dict | None) -> dict:
         "counters": {key: value for key in COUNTERS
                      if (value := number(event.get(key))) is not None},
     }
-    if stage == "recovery-rollback":
-        evidence["stage"]["meaning"] = (
-            "The database is undoing an interrupted transaction before recovery can proceed. "
-            "Falling remaining_rows indicates rollback progress, not resumed wrangling. "
-            "Slowness alone is not grounds to kill or restart it."
-        )
+    label, meaning = stage_info(stage, evidence["stage"]["step"])
+    evidence["stage"].update(label=label, meaning=meaning)
+    evidence["instrumentation"] = (
+        "idle_seconds is time without a reported counter change or milestone, not CPU idle time. "
+        "Long SQL statements may emit no intermediate row counters. No counters does not "
+        "mean the stage details are missing or the SQL process is dead."
+    )
+    activity = snapshot.get("activity") or {}
+    activity_at = parse_stamp(activity.get("logged_at"))
+    activity_age = (observed - activity_at).total_seconds() if observed and activity_at else -1
+    cpu, interval = number(activity.get("cpu_seconds")), number(activity.get("interval_seconds"))
+    if cpu is not None and interval is not None and interval > 0 and 0 <= activity_age <= STALE_SECONDS:
+        evidence["process_activity"] = {
+            "cpu_seconds_increase": cpu, "interval_seconds": interval,
+            "meaning": "CPU use by the monitored process, not a count of rows or proof that a SQL statement has returned.",
+        }
+    evidence["milestones"] = []
+    for milestone in (snapshot.get("milestones") or [])[-4:]:
+        name, kind, substep = milestone.get("stage"), milestone.get("event"), milestone.get("step")
+        if (not isinstance(name, str) or name not in STAGES or not isinstance(kind, str)
+                or kind not in {"started", "completed", "failed", "sql-stage"}):
+            continue
+        if not isinstance(substep, str) or substep not in STEPS:
+            substep = None
+        milestone_at = parse_stamp(milestone.get("logged_at"))
+        if not observed or not milestone_at or milestone_at > observed:
+            continue
+        milestone_label, _ = stage_info(name, substep)
+        evidence["milestones"].append({"stage": name, "label": milestone_label, "event": kind})
     if not previous:
         return evidence
     invocation = source_service.get("InvocationID")
     if (not isinstance(invocation, str) or not INVOCATION.fullmatch(invocation)
-            or invocation != previous.get("invocation")
-            or stage != previous.get("stage") or step != previous.get("step")):
-        evidence["comparison"] = {"status": "different_run_or_stage"}
+            or invocation != previous.get("invocation")):
+        evidence["comparison"] = {"status": "different_run"}
+        return evidence
+    if stage != previous.get("stage") or step != previous.get("step"):
+        old_stage, old_step = previous.get("stage"), previous.get("step")
+        old_label, _ = stage_info(old_stage, old_step)
+        evidence["comparison"] = {"status": "stage_changed_same_run", "previous_stage_label": old_label,
+                                  "meaning": "The same recovery run has changed stage; counters are not comparable across stages."}
         return evidence
     old_logged = parse_stamp(previous.get("logged_at"))
     if not logged or not old_logged or logged <= old_logged:
@@ -479,12 +538,19 @@ def ai_assessment(snapshot: dict, previous: dict | None, state_file: Path) -> st
 def render_report(snapshot: dict, previous: dict | None = None) -> tuple[str, str]:
     service, event = snapshot["service"], snapshot.get("event")
     status, description = service_status(service)
-    subject = f"[OJS recovery] {status} - {snapshot['observed_at']}"
+    label, _ = stage_info((event or {}).get("stage"), (event or {}).get("step"))
+    observed, logged = parse_stamp(snapshot.get("observed_at")), parse_stamp((event or {}).get("logged_at"))
+    age = (observed - logged).total_seconds() if observed and logged else -1
+    if status != "Running" or not 0 <= age <= STALE_SECONDS or (event or {}).get("event") in {"completed", "failed"}:
+        label = "Last stage: " + label
+    subject = f"[OJS recovery] {status} | {label} - {snapshot['observed_at']}"
     lines = ["OJS recovery progress report", "Observed (UTC): " + snapshot["observed_at"],
-             description, "Service: " + SERVICE,
+             "", *overview(snapshot, previous), "", "Technical details", description, "Service: " + SERVICE,
              "Systemd: " + "; ".join(f"{key}={service.get(key, 'unavailable')}"
                                         for key in ("ActiveState", "SubState", "Result", "MainPID")),
              "Invocation: " + service.get("InvocationID", "unavailable"), ""]
+    if service.get("SubState") == "dead":
+        lines.append("Systemd's 'dead' label means the service is inactive; it is not, by itself, a crash report.")
     if event:
         lines.append("Last observed stage: " + event["stage"])
         if event.get("step"):
@@ -516,9 +582,15 @@ def render_report(snapshot: dict, previous: dict | None = None) -> tuple[str, st
                   "Disk free, root / project data: " + quantity(snapshot["root_free"])
                   + " / " + quantity(snapshot["data_free"]),
                   "", "Heartbeats indicate that the monitor is alive, not that SQL is advancing.",
-                  "No percentage or ETA is inferred. Only systemd, a bounded journal tail, and host resources were read."])
+                  "No overall percentage or ETA is inferred. Only systemd, bounded journal tails, and host resources were read."])
     lines.extend(snapshot["warnings"])
     return subject, "\n".join(lines) + "\n"
+
+
+def add_assessment(body: str, assessment: str) -> str:
+    """Keep measured status first; optional prose never replaces the facts."""
+    heading, separator, details = body.partition("\nTechnical details\n")
+    return heading + "\n" + assessment + "\n" + separator + details
 
 
 def email_address(value: str | None) -> str:
@@ -652,14 +724,13 @@ def main(argv: list[str] | None = None) -> int:
             if os.environ.get("OJS_PROGRESS_LLM_ENABLED") == "1":
                 try:
                     summary = ai_assessment(snapshot, previous, args.state_file)
-                    body = ("AI assessment (interpretation; verify against the observations below):\n"
-                            + summary + "\n\nRecorded observations\n\n" + body)
+                    body = add_assessment(body, "AI interpretation (exact figures and status are recorded above):\n" + summary)
                     print("AI assessment generated; factual observations retained.")
                 except progress_llm.SummaryUnavailable as error:
-                    body = "AI assessment unavailable; factual report follows.\n\n" + body
+                    body = add_assessment(body, "Optional AI interpretation unavailable; the recorded report is unaffected.")
                     print(f"AI assessment unavailable; sending factual report. {error}")
                 except Exception:
-                    body = "AI assessment unavailable; factual report follows.\n\n" + body
+                    body = add_assessment(body, "Optional AI interpretation unavailable; the recorded report is unaffected.")
                     print("AI assessment unavailable; sending factual report.")
             send_email(sender, recipient, password, subject, body)
             accepted = True

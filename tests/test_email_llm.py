@@ -19,6 +19,35 @@ SUMMARY = "Rollback is still in progress. The comparable counters show that work
 
 
 class EvidenceTests(unittest.TestCase):
+    def test_stage_meaning_cpu_activity_and_transition_are_grounded(self):
+        current = snapshot(stage="temporal finalization phase", step="exact_keys", idle_seconds=20000)
+        current["activity"] = {"cpu_seconds": 4, "interval_seconds": 30,
+                               "logged_at": current["event"]["logged_at"], "process_pid": PRIVATE}
+        current["milestones"] = [snapshot(stage="recovery-metadata-audit", event="completed", age=4000)["event"]]
+        previous = report.comparable_state(snapshot(stage="recovery-metadata-audit", age=4100), NOW)
+        evidence = report.llm_evidence(current, previous)
+        self.assertIn("DOI", evidence["stage"]["meaning"])
+        self.assertEqual(evidence["process_activity"]["cpu_seconds_increase"], 4)
+        self.assertEqual(evidence["comparison"]["status"], "stage_changed_same_run")
+        self.assertEqual(evidence["milestones"][0]["event"], "completed")
+        self.assertNotIn("systemd", evidence)
+        self.assertNotIn(PRIVATE, json.dumps(evidence))
+        report.progress_llm._payload(evidence)  # Still fits the bounded input allowance.
+
+    def test_stale_cpu_activity_is_not_presented_as_current_activity(self):
+        current = snapshot()
+        current["activity"] = {"cpu_seconds": 4, "interval_seconds": 30,
+                               "logged_at": snapshot(age=900)["event"]["logged_at"]}
+        self.assertNotIn("process_activity", report.llm_evidence(current, None))
+
+    def test_dead_raw_service_label_is_not_sent_to_model_as_a_diagnosis(self):
+        current = snapshot()
+        current["service"].update(ActiveState="inactive", SubState="dead", Result="success",
+                                  ExecMainCode=1, ExecMainStatus=0)
+        evidence = report.llm_evidence(current, None)
+        self.assertNotIn("SubState", json.dumps(evidence))
+        self.assertNotEqual(evidence["service_status"], "Failed")
+
     def test_outbound_evidence_excludes_identifiers_paths_and_arbitrary_text(self):
         current = snapshot(remaining_rows=100)
         current["service"]["MainPID"] = 987654321
@@ -104,16 +133,19 @@ class IntegrationTests(unittest.TestCase):
             result = report.main(["--state-file", str(self.state), *arguments])
         return result, out.getvalue() + err.getvalue(), password, send, generate
 
-    def test_generated_assessment_precedes_unchanged_exact_facts(self):
+    def test_generated_assessment_follows_measured_summary_and_preserves_details(self):
         result, output, password, send, generate = self.run_report()
         self.assertEqual(result, 0)
         generate.assert_called_once()
         self.assertEqual(generate.call_args.kwargs["budget_path"], self.state.parent / "llm-budget.json")
         self.assertEqual(generate.call_args.kwargs["credential_path"], self.root / "credentials" / "openai-api-key")
         body = send.call_args.args[-1]
-        self.assertTrue(body.startswith("AI assessment"))
+        factual = report.render_report(self.current)[1]
+        heading, _, details = factual.partition("\nTechnical details\n")
+        self.assertTrue(body.startswith(heading))
         self.assertIn(SUMMARY, body)
-        self.assertTrue(body.endswith(report.render_report(self.current)[1]))
+        self.assertTrue(body.endswith(details))
+        self.assertLess(body.index(SUMMARY), body.index("Technical details"))
         self.assertNotIn(PRIVATE, json.dumps(generate.call_args.args[0]))
         self.assertNotIn(SUMMARY, output)  # Scheduled runs don't dump generated text into logs.
         self.assertNotIn(PRIVATE, output)
@@ -123,7 +155,8 @@ class IntegrationTests(unittest.TestCase):
             with self.subTest(error=type(error).__name__):
                 result, output, password, send, generate = self.run_report("--force", error=error)
                 self.assertEqual(result, 0)
-                self.assertTrue(send.call_args.args[-1].startswith("AI assessment unavailable; factual report follows."))
+                self.assertTrue(send.call_args.args[-1].startswith("OJS recovery progress report"))
+                self.assertIn("Optional AI interpretation unavailable; the recorded report is unaffected.", send.call_args.args[-1])
                 self.assertNotIn(PRIVATE, output)
                 self.assertIn("accepted by SMTP", output)
 
@@ -196,7 +229,7 @@ class IntegrationTests(unittest.TestCase):
         result, output, password, send, generate = self.run_report("--force", error=report.progress_llm.SummaryUnavailable())
         self.assertEqual(result, 0)
         self.assertNotIn("force", generate.call_args.kwargs)
-        self.assertIn("AI assessment unavailable", send.call_args.args[-1])
+        self.assertIn("AI interpretation unavailable", send.call_args.args[-1])
 
 
 if __name__ == "__main__":

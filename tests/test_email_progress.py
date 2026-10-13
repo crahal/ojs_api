@@ -114,7 +114,7 @@ class SnapshotTests(unittest.TestCase):
 
     def test_collects_bounded_current_invocation_tail_and_two_known_filesystems(self):
         with mock.patch.object(report, "diagnostic", side_effect=[
-                service_text(), journal(remaining_rows=500), service_text()]) as diagnostic, \
+                service_text(), journal(remaining_rows=500), "", service_text()]) as diagnostic, \
                 mock.patch.object(report, "free_bytes", return_value=10) as disk, \
                 mock.patch.object(report, "host_memory", return_value={}), \
                 mock.patch.object(report, "utc_now", return_value=NOW):
@@ -125,18 +125,48 @@ class SnapshotTests(unittest.TestCase):
         self.assertIn("--lines=300", commands[1])
         self.assertIn("_SYSTEMD_INVOCATION_ID=" + INVOCATION, commands[1])
         self.assertNotIn("--all", commands[1])
-        self.assertEqual(commands[0], commands[2])
+        self.assertIn("--lines=128", commands[2])
+        self.assertIn("_SYSTEMD_INVOCATION_ID=" + INVOCATION, commands[2])
+        self.assertTrue(any(arg.startswith("--grep=") for arg in commands[2]))
+        self.assertEqual(commands[0], commands[3])
         self.assertEqual(disk.call_args_list, [mock.call(Path("/")), mock.call(Path("/project/data"))])
 
     def test_restart_during_collection_excludes_previous_run(self):
         with mock.patch.object(report, "diagnostic", side_effect=[
-                service_text(), journal(event="failed"), service_text(OLD_INVOCATION)]), \
+                service_text(), journal(event="failed"), "", service_text(OLD_INVOCATION)]), \
                 mock.patch.object(report, "free_bytes", return_value=10), \
                 mock.patch.object(report, "host_memory", return_value={}):
             current = report.collect_snapshot(Path("/project"))
         self.assertIsNone(current["event"])
         self.assertEqual(current["service"]["InvocationID"], OLD_INVOCATION)
         self.assertIn("changed during collection", " ".join(current["warnings"]))
+        self.assertEqual(current["milestones"], [])
+        self.assertEqual(current["activity"], {})
+
+    def test_milestones_and_cpu_activity_are_collected_without_database_access(self):
+        tail = "\n".join([
+            journal("temporal finalization phase", age=40, step="exact_keys", process_pid=77, process_cpu_seconds=100),
+            journal("temporal finalization phase", age=10, step="exact_keys", process_pid=77, process_cpu_seconds=104),
+        ])
+        history = journal("recovery-metadata-audit", age=4000, event="completed", completed_ranges=32, total_ranges=32)
+        with mock.patch.object(report, "diagnostic", side_effect=[service_text(), tail, history, service_text()]), \
+                mock.patch.object(report, "free_bytes", return_value=10), \
+                mock.patch.object(report, "host_memory", return_value={}), \
+                mock.patch.object(report, "utc_now", return_value=NOW):
+            current = report.collect_snapshot(Path("/project"))
+        self.assertEqual(current["milestones"][0]["stage"], "recovery-metadata-audit")
+        self.assertEqual(current["activity"]["cpu_seconds"], 4)
+        self.assertEqual(current["event"]["step"], "exact_keys")
+
+    def test_unavailable_milestone_query_keeps_recent_stage(self):
+        with mock.patch.object(report, "diagnostic", side_effect=[
+                service_text(), journal(remaining_rows=500), report.ReportError(), service_text()]), \
+                mock.patch.object(report, "free_bytes", return_value=10), \
+                mock.patch.object(report, "host_memory", return_value={}):
+            current = report.collect_snapshot(Path("/project"))
+        self.assertEqual(current["event"]["remaining_rows"], 500)
+        self.assertEqual(current["milestones"], [])
+        self.assertIn("milestones unavailable", " ".join(current["warnings"]))
 
     def test_no_invocation_does_not_read_historical_journal(self):
         with mock.patch.object(report, "diagnostic", return_value="ActiveState=inactive\n") as diagnostic, \
@@ -172,7 +202,7 @@ class ReportTests(unittest.TestCase):
         self.assertIn("Recent stage observation", body)
         self.assertIn("43,200 seconds since a counter change or milestone", body)
         self.assertIn("not that SQL is advancing", body)
-        self.assertIn("No percentage or ETA is inferred", body)
+        self.assertIn("No overall percentage or ETA is inferred", body)
         self.assertIn("Current service memory: 0.10 GiB", body)
         self.assertNotIn("%", body)
 
@@ -186,7 +216,7 @@ class ReportTests(unittest.TestCase):
                  ({"ActiveState": "failed", "Result": "exit-code"}, "Failed"),
                  ({"ActiveState": "inactive", "Result": "exit-code"}, "Failed"),
                  ({"ActiveState": "inactive", "Result": "success", "ExecMainCode": 1,
-                   "ExecMainStatus": 0}, "Finished"),
+                   "ExecMainStatus": 0}, "Job exited"),
                  ({"ActiveState": "deactivating", "Result": "success"}, "Stopping")]
         for properties, expected in cases:
             with self.subTest(expected=expected):
@@ -194,7 +224,7 @@ class ReportTests(unittest.TestCase):
                 current["service"].update(properties)
                 subject, body = report.render_report(current)
                 self.assertIn(expected, subject)
-                if expected == "Finished":
+                if expected == "Job exited":
                     self.assertIn("recovery/data completion is unverified", body)
 
     def test_unknown_and_future_timestamps_are_not_fresh(self):
