@@ -46,6 +46,13 @@ def snapshot(*, stage="recovery-rollback", event="heartbeat", age=10, **fields):
 
 
 class SnapshotTests(unittest.TestCase):
+    def test_same_second_milestones_keep_journal_order_even_in_reverse_output(self):
+        audit = json.loads(journal("recovery-metadata-audit", event="completed"))
+        keys = json.loads(journal("temporal finalization phase", event="sql-stage", step="exact_keys"))
+        keys["__REALTIME_TIMESTAMP"] = str(int(audit["__REALTIME_TIMESTAMP"]) + 100)
+        parsed = report.parse_events(json.dumps(keys) + "\n" + json.dumps(audit), INVOCATION)
+        self.assertEqual([item["stage"] for item in parsed], ["recovery-metadata-audit", "temporal finalization phase"])
+
     def test_milestone_filter_is_anchored_and_matches_only_progress_milestones(self):
         import re
         self.assertTrue(report.MILESTONE_PATTERN.startswith(r"^\[progress\] "))

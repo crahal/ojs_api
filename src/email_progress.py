@@ -243,10 +243,13 @@ def parse_events(output: str, invocation: str) -> list[dict]:
             pid = payload.get("process_pid")
             if isinstance(pid, int) and not isinstance(pid, bool) and 0 < pid < 2 ** 31:
                 safe["process_pid"] = pid
-            events.append(safe)
+            # --grep with a line limit can return newest-first. Preserve the
+            # journal's microsecond ordering before formatting times to seconds;
+            # audit completion and the next SQL phase can share a second.
+            events.append((micros, safe))
         except (ValueError, OverflowError, OSError, RecursionError):
             continue
-    return sorted(events, key=lambda event: event["logged_at"])
+    return [event for _, event in sorted(events, key=lambda item: item[0])]
 
 
 def select_event(events: list[dict]) -> dict | None:
