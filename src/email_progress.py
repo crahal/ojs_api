@@ -39,7 +39,7 @@ MILESTONE_LINES = 128
 # A separate bounded, filtered tail retains phase transitions when hours of
 # heartbeats have pushed them out of the ordinary tail. Never read SQL content.
 MILESTONE_PATTERN = (
-    r'(?=.*"event"\s*:\s*"(?:started|completed|failed|sql-stage)")'
+    r'^\[progress\] (?=.*"event"\s*:\s*"(?:started|completed|failed|sql-stage)")'
     r'(?=.*"stage"\s*:\s*"(?:recovery-rollback|recovery-metadata-audit|'
     r'temporal finalization phase|source-index phase|sql-import|'
     r'update-build|update-recover-exact-keys)")'

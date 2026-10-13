@@ -151,6 +151,16 @@ class MilestoneTests(unittest.TestCase):
         self.assertEqual(result[1]["total_ranges"], 32)
         self.assertEqual(result[1]["note"], observations.AUDIT_SCAN_NOTE)
 
+    def test_phase_starts_do_not_displace_rollback_and_audit_completion(self):
+        events = [event(120, stage="recovery-rollback", kind="started"),
+                  event(100, stage="recovery-rollback", kind="completed"),
+                  event(90, stage="recovery-metadata-audit", kind="started"),
+                  event(60, stage="recovery-metadata-audit", kind="completed"),
+                  event(50, kind="started", step=None), event(40, kind="sql-stage")]
+        result = observations.recent_milestones(events)
+        self.assertIn(("recovery-rollback", "completed"), [(item["stage"], item["event"]) for item in result])
+        self.assertIn(("recovery-metadata-audit", "completed"), [(item["stage"], item["event"]) for item in result])
+
     def test_invalid_milestone_counts_are_not_retained(self):
         for value in (None, "never-copy", True, -1, float("nan"), float("inf"), 10 ** 30):
             with self.subTest(value=value):

@@ -53,6 +53,12 @@ class StageDescriptionTests(unittest.TestCase):
 
 
 class OverviewTests(unittest.TestCase):
+    def test_same_exact_key_stage_is_explicit_without_claiming_row_progress(self):
+        current = event()
+        text = "\n".join(overview(snapshot(current), previous(current)))
+        self.assertIn("Still at the same stage as the previous report", text)
+        self.assertIn("no intermediate row counter", text)
+
     def test_current_exact_key_stage_is_named_and_explained(self):
         text = "\n".join(overview(snapshot()))
         self.assertIn("Current observed stage: Building article matching keys", text)

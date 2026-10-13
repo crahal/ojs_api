@@ -46,6 +46,15 @@ def snapshot(*, stage="recovery-rollback", event="heartbeat", age=10, **fields):
 
 
 class SnapshotTests(unittest.TestCase):
+    def test_milestone_filter_is_anchored_and_matches_only_progress_milestones(self):
+        import re
+        self.assertTrue(report.MILESTONE_PATTERN.startswith(r"^\[progress\] "))
+        pattern = re.compile(report.MILESTONE_PATTERN)
+        message = json.loads(journal("recovery-metadata-audit", event="completed"))["MESSAGE"]
+        self.assertIsNotNone(pattern.search(message))
+        self.assertIsNone(pattern.search(json.loads(journal())["MESSAGE"]))
+        self.assertIsNone(pattern.search("untrusted prefix " + message))
+
     def test_properties_are_allowlisted_and_invalid_values_omitted(self):
         service = report.parse_service(service_text() + "ExecStart=" + SECRET + "\n"
                                        "MemoryCurrent=18446744073709551615\n"

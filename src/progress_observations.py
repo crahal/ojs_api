@@ -120,7 +120,9 @@ def recent_milestones(events: list[dict]) -> list[dict]:
                 milestone[field] = value
         if stage == "recovery-metadata-audit" and kind == "completed":
             milestone["note"] = AUDIT_SCAN_NOTE
-        priority = 2 if kind == "failed" else 1 if stage in HIGH_LEVEL_STAGES else 0
+        priority = (3 if kind == "failed" else
+                    2 if stage in HIGH_LEVEL_STAGES and kind in {"completed", "sql-stage"} else
+                    1 if stage in HIGH_LEVEL_STAGES else 0)
         candidates.append((priority, logged, position, milestone))
     chosen = sorted(candidates, key=lambda item: item[:3])[-4:]
     return [item[3] for item in sorted(chosen, key=lambda item: (item[1], item[2]))]

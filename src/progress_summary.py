@@ -125,7 +125,7 @@ def _duration(seconds: int | float) -> str:
         return f"{seconds:,.1f}".rstrip("0").rstrip(".") + " seconds"
     minutes = int(seconds) // 60
     if minutes < 60:
-        return f"{minutes:,} minutes"
+        return f"{minutes:,} minute" + ("s" if minutes != 1 else "")
     hours, minutes = divmod(minutes, 60)
     return f"{hours:,} hours" + (f" {minutes} minutes" if minutes else "")
 
@@ -172,6 +172,8 @@ def _comparison(service: dict, event: dict, previous: dict | None,
             "metadata-shard": ("extracted_rows", "extracted-row")}
     key, label = keys.get(event.get("stage"), (None, None))
     if key is None:
+        if event.get("stage") == "temporal finalization phase" and event.get("step") == "exact_keys":
+            return "Still at the same stage as the previous report; this step has no intermediate row counter."
         return None
     current, old = _counter(event, key), _counter(previous, key)
     if current is None or old is None:
