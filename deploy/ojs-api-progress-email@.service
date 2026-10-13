@@ -1,0 +1,43 @@
+[Unit]
+Description=Email a read-only OJS recovery progress report to subscriber %i
+Wants=network-online.target
+After=network-online.target
+RequiresMountsFor=/srv/ojs_api/data
+
+[Service]
+Type=oneshot
+User=ojs
+Group=ojs
+SupplementaryGroups=systemd-journal
+WorkingDirectory=/srv/ojs_api
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/etc/ojs-api/progress-email.env
+EnvironmentFile=/etc/ojs-api/progress-email-%i.env
+LoadCredential=gmail-app-password:/etc/ojs-api/progress-email-password
+ExecStart=/usr/bin/python3 /srv/ojs_api/src/email_progress.py --state-file /var/lib/ojs-api-report/subscriber-%i.json --min-send-interval-hours=72 --lock-wait-seconds=60
+StateDirectory=ojs-api-report
+StateDirectoryMode=0700
+UMask=0077
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ojs-api-progress-email
+TimeoutStartSec=240
+MemoryMax=96M
+TasksMax=16
+Nice=19
+CPUWeight=1
+IOWeight=1
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+InaccessiblePaths=-/run/docker.sock -/var/run/docker.sock /srv/ojs_api/.env /srv/ojs_api/.secrets
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=

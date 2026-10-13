@@ -641,18 +641,26 @@ def send_email(sender: str, recipient: str, password: str, subject: str, body: s
 
 
 @contextmanager
-def report_lock(state_file: Path):
+def report_lock(state_file: Path, *, wait_seconds: int = 0):
+    """Serialize all recipients and previews sharing the same budget directory."""
     state_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    descriptor = os.open(str(state_file) + ".lock",
+    # Preserve the primary report's existing lock, also used by subscribers.
+    descriptor = os.open(state_file.parent / "last-sent.json.lock",
                          os.O_CREAT | os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
     try:
         os.fchmod(descriptor, 0o600)
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            yield False
-        else:
-            yield True
+        deadline = time.monotonic() + wait_seconds
+        while True:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    yield False
+                    return
+                time.sleep(min(0.25, remaining))
+        yield True
     finally:
         os.close(descriptor)
 
@@ -685,8 +693,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--project-root", type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument("--state-file", type=Path, default=DEFAULT_STATE)
     parser.add_argument("--password-file", type=Path, help="Explicit credential path for manual use.")
-    parser.add_argument("--force", action="store_true", help="Send even if a report was accepted less than 11 hours ago.")
+    parser.add_argument("--min-send-interval-hours", type=int, default=MIN_SEND_INTERVAL_SECONDS // 3600,
+                        help="Minimum interval between accepted messages for this state file (default: 11 hours).")
+    parser.add_argument("--lock-wait-seconds", type=int, default=0,
+                        help="Wait up to this many seconds for another recipient's report (0 through 60).")
+    parser.add_argument("--force", action="store_true", help="Bypass the recipient's minimum send interval, but not AI limits.")
     args = parser.parse_args(argv)
+    if not 1 <= args.min_send_interval_hours <= 8760:
+        parser.error("--min-send-interval-hours must be between 1 and 8760")
+    if not 0 <= args.lock_wait_seconds <= 60:
+        parser.error("--lock-wait-seconds must be between 0 and 60")
     accepted = False
     try:
         if args.dry_run:
@@ -695,7 +711,7 @@ def main(argv: list[str] | None = None) -> int:
             print("Subject: " + subject + "\n\n" + body, end="")
             return 0
         if args.preview_llm:
-            with report_lock(args.state_file) as acquired:
+            with report_lock(args.state_file, wait_seconds=args.lock_wait_seconds) as acquired:
                 if not acquired:
                     print("AI preview unavailable: another report is in progress.", file=sys.stderr)
                     return 1
@@ -712,13 +728,17 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
         sender = email_address(os.environ.get("OJS_PROGRESS_EMAIL_FROM"))
         recipient = email_address(os.environ.get("OJS_PROGRESS_EMAIL_TO"))
-        with report_lock(args.state_file) as acquired:
+        with report_lock(args.state_file, wait_seconds=args.lock_wait_seconds) as acquired:
             if not acquired:
+                if args.lock_wait_seconds:
+                    print("Progress report not sent: report lock wait expired.", file=sys.stderr)
+                    return 1
                 print("Progress report skipped: another report is in progress.")
                 return 0
             previous = read_state(args.state_file)
             sent_at = parse_stamp(previous.get("sent_at")) if previous else None
-            if not args.force and sent_at is not None and (utc_now() - sent_at).total_seconds() < MIN_SEND_INTERVAL_SECONDS:
+            if (not args.force and sent_at is not None
+                    and (utc_now() - sent_at).total_seconds() < args.min_send_interval_hours * 3600):
                 print("Recent progress report already sent; skipped.")
                 return 0
             snapshot = collect_snapshot(args.project_root)

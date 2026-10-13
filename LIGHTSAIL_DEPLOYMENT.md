@@ -436,7 +436,7 @@ is not supplied through the process environment. The service runs as `ojs`,
 adds `systemd-journal` access only for this service, and makes the project/data
 read-only within its sandbox. Docker sockets and the API's `.env`/`.secrets`
 are inaccessible to the service. It retains one bounded delivery-state file,
-`/var/lib/ojs-api-report/last-sent.json`, and its lock; the journal receives brief
+`/var/lib/ojs-api-report/last-sent.json`, and a shared reporting lock; the journal receives brief
 delivery status without report dumps or credentials.
 
 On first configuration, the chained commands enable the timer only after a
@@ -445,6 +445,59 @@ Success means Gmail's SMTP server accepted the message; check the recipient's
 inbox/spam folder to confirm arrival. If authentication fails, leave the timer
 disabled and correct or replace the credential through a private operator
 workflow; blindly rerunning the helper cannot replace its existing files.
+
+#### Additional recipient every three days
+
+The subscriber template keeps the primary recipient's 12-hour timer and address
+unchanged. Each subscriber has a private recipient override and its own tiny
+comparison/delivery-state file; reports compare against that person's previous
+delivery. The sender and Gmail credential are reused, not copied. Install the
+updated primary service as well so coincident reports wait up to 60 seconds for
+the shared reporting lock; do not restart the primary timer or the recovery job.
+
+For an already-tested sender, substitute the colleague's address below and use
+a unique lowercase instance name instead of `colleague` if required:
+
+```bash
+cd /srv/ojs_api
+sudo install -o root -g root -m 644 deploy/ojs-api-progress-email.service /etc/systemd/system/ojs-api-progress-email.service
+sudo install -o root -g root -m 644 deploy/ojs-api-progress-email@.service /etc/systemd/system/ojs-api-progress-email@.service
+sudo install -o root -g root -m 644 deploy/ojs-api-progress-email@.timer /etc/systemd/system/ojs-api-progress-email@.timer
+sudo python3 -B scripts/configure_progress_recipient.py --name colleague --recipient COLLEAGUE_EMAIL &&
+sudo systemctl daemon-reload &&
+sudo systemctl enable --now ojs-api-progress-email@colleague.timer
+sudo systemctl list-timers ojs-api-progress-email.timer ojs-api-progress-email@colleague.timer --no-pager
+```
+
+This sends **no immediate message**: the first is scheduled 72 hours after
+activation, then 72 hours after each service completion (plus timer accuracy of
+up to one minute). Completion-based scheduling avoids a send-interval check
+skipping the next run because its preceding SMTP delivery finished a few
+seconds after the service started. A host reboot starts a fresh timer interval;
+missed messages are not replayed. The independent 72-hour duplicate-send guard
+also applies to manual starts unless `--force` is explicitly used.
+
+If the primary reporter already has its validated optional AI configuration,
+reuse that configuration for this subscriber as well:
+
+```bash
+sudo install -d -o root -g root -m 755 /etc/systemd/system/ojs-api-progress-email@colleague.service.d
+sudo install -o root -g root -m 644 /etc/systemd/system/ojs-api-progress-email.service.d/30-openai.conf /etc/systemd/system/ojs-api-progress-email@colleague.service.d/30-openai.conf
+sudo systemctl daemon-reload
+```
+
+All recipients and previews share the existing AI request allowance and lock;
+adding a recipient does not increase spending limits. Additional reports can
+use up the monthly allowance earlier; messages still go out with the factual
+report if optional AI generation is unavailable. A lock timeout is recorded as
+a failed email service, never as a successful delivery or recovery failure.
+
+Inspect just this subscriber with
+`sudo journalctl -u ojs-api-progress-email@colleague.service -n 20 --no-pager`.
+To stop their future messages without changing anyone else's reports:
+`sudo systemctl disable --now ojs-api-progress-email@colleague.timer`.
+
+#### Primary recipient schedule
 
 Later starts skip sending if a successful delivery was recorded less than
 11 hours ago, preventing duplicate reports from nearby or manual triggers.

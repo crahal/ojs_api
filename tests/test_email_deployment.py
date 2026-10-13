@@ -23,7 +23,7 @@ class EmailDeploymentTest(unittest.TestCase):
         self.assertEqual(unit["Service"]["Type"], "oneshot")
         self.assertEqual(
             unit["Service"]["ExecStart"],
-            "/usr/bin/python3 /srv/ojs_api/src/email_progress.py",
+            "/usr/bin/python3 /srv/ojs_api/src/email_progress.py --lock-wait-seconds=60",
         )
         for value in unit["Unit"].values():
             self.assertNotIn("ojs-api-update", value)

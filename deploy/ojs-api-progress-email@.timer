@@ -1,0 +1,15 @@
+[Unit]
+Description=Send OJS progress email to subscriber %i every 72 hours
+
+[Timer]
+# Requires an already-tested primary sender. The first subscriber message is
+# 72 hours after timer activation; later runs are 72 hours after completion.
+# Completion-based timing leaves the full minimum interval after SMTP acceptance.
+# After reboot the timer begins a fresh interval; it never replays a backlog.
+OnActiveSec=72h
+OnUnitInactiveSec=72h
+AccuracySec=1min
+Unit=ojs-api-progress-email@%i.service
+
+[Install]
+WantedBy=timers.target
